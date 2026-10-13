@@ -511,17 +511,27 @@ async function extractStreams(detail) {
     const info = getQualityInfo(item.quality, url);
     const emoji = getQualityEmoji(info.resolution);
 
-    streams.push({
-      name: emoji + " " + info.label + " | 👴🏻✌🏻515",
-      title: "🎬 Oscar TV · 🎞️ " + info.quality,
-      url,
-      quality: info.quality,
-      resolution: info.resolution,
-      headers: {
-        "User-Agent": PLAY_UA,
-        "Referer": OSCAR_HOME + "/"
-      }
-    });
+    
+ streams.push({
+  name: "\u200E" + emoji + " " + info.label,
+  title:
+    "🎞️ " + info.quality + " · " + format + " · 🎬 Oscar TV\n" +
+    "made by 👴🏻✌🏻⁵¹⁵",
+  description:
+    "🎞️ " + info.quality + " · " + format + " · 🎬 Oscar TV\n" +
+    "made by 👴🏻✌🏻⁵¹⁵",
+  size:
+    "🎞️ " + info.quality + " · " + format + " · 🎬 Oscar TV\n" +
+    "made by 👴🏻✌🏻⁵¹⁵",
+  url,
+  quality: info.quality,
+  resolution: info.resolution,
+  headers: {
+    "User-Agent": PLAY_UA,
+    "Referer": OSCAR_HOME + "/"
+  }
+});
+
   }
 
   streams.sort((a, b) => qualityRank(b) - qualityRank(a));
