@@ -1,13 +1,15 @@
+
 "use strict";
 
 /**
- * This project is just a test made by AI
+ ©© This project is just a test made by AI
  * Z3ter Provider - AlooyTV
  * Nuvio contract: getStreams(tmdbId, mediaType, season, episode)
  *
- * Source logic adapted from:
- * mo7AmMeD64/cs-ar/Alooytv
+ * Adapted from:
+ * https://github.com/mo7AmMeD64/cs-ar/tree/main/Alooytv
  *
+ * Supports Arabic and English title searches.
  * Uses global fetch. No Node.js built-ins or external packages.
  */
 
@@ -21,6 +23,8 @@ const USER_AGENT =
   "Chrome/131.0.0.0 Safari/537.36";
 
 let cachedDomain = null;
+
+/* -------------------- HTML utilities -------------------- */
 
 function decodeHtml(value) {
   return String(value || "")
@@ -44,13 +48,20 @@ function stripTags(value) {
       .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ")
       .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ")
       .replace(/<[^>]*>/g, " ")
-  ).replace(/\s+/g, " ").trim();
+  )
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function getAttribute(tag, name) {
   const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const match = tag.match(
-    new RegExp("\\b" + escaped + "\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)'|([^\\s>]+))", "i")
+
+  const match = String(tag || "").match(
+    new RegExp(
+      "\\b" + escaped +
+      "\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)'|([^\\s>]+))",
+      "i"
+    )
   );
 
   return match
@@ -62,18 +73,22 @@ function absoluteUrl(url, base) {
   const value = decodeHtml(String(url || "").trim());
 
   if (!value) return "";
+
   if (/^(https?:)?\/\//i.test(value)) {
-    return value.startsWith("//") ? "https:" + value : value;
+    return value.startsWith("//")
+      ? "https:" + value
+      : value;
   }
 
-  if (/^(data:|blob:|javascript:)/i.test(value)) return "";
-
-  if (value.startsWith("/")) {
-    const origin = String(base).match(/^https?:\/\/[^/]+/i);
-    return origin ? origin[0] + value : "";
+  if (/^(data:|blob:|javascript:)/i.test(value)) {
+    return "";
   }
 
-  return String(base).replace(/\/+$/, "") + "/" + value.replace(/^\/+/, "");
+  try {
+    return new URL(value, base).href;
+  } catch (_) {
+    return "";
+  }
 }
 
 async function fetchText(url, options = {}) {
@@ -81,7 +96,8 @@ async function fetchText(url, options = {}) {
     method: options.method || "GET",
     headers: {
       "User-Agent": USER_AGENT,
-      "Accept": "text/html,application/xhtml+xml,application/json,*/*",
+      "Accept":
+        "text/html,application/xhtml+xml,application/json,*/*",
       "Accept-Language": "ar,en;q=0.9",
       ...(options.headers || {})
     },
@@ -90,7 +106,9 @@ async function fetchText(url, options = {}) {
   });
 
   if (!response.ok) {
-    throw new Error("HTTP " + response.status + " for " + url);
+    throw new Error(
+      "HTTP " + response.status + " for " + url
+    );
   }
 
   return {
@@ -100,29 +118,34 @@ async function fetchText(url, options = {}) {
   };
 }
 
-/**
- * Small HTML tokenizer.
- * Keeps parent/child relationships so search results can be limited to
- * direct children of .movie-container, matching the original provider.
- */
+/* -------------------- HTML parser -------------------- */
+
 function parseHtml(html) {
+  const source = String(html || "");
   const nodes = [];
   const stack = [];
-  const tokenPattern = /<!--[\s\S]*?-->|<![^>]*>|<\/?[a-zA-Z][^>]*>/g;
+
+  const tokenPattern =
+    /<!--[\s\S]*?-->|<![^>]*>|<\/?[a-zA-Z][^>]*>/g;
+
   const voidTags = new Set([
-    "area", "base", "br", "col", "embed", "hr", "img",
-    "input", "link", "meta", "param", "source", "track", "wbr"
+    "area", "base", "br", "col", "embed", "hr",
+    "img", "input", "link", "meta", "param",
+    "source", "track", "wbr"
   ]);
 
   let match;
 
-  while ((match = tokenPattern.exec(String(html || ""))) !== null) {
+  while ((match = tokenPattern.exec(source)) !== null) {
     const token = match[0];
 
-    if (token.startsWith("<!--") || token.startsWith("<!")) continue;
+    if (token.startsWith("<!--") || token.startsWith("<!")) {
+      continue;
+    }
 
     const closing = /^<\//.test(token);
     const tagMatch = token.match(/^<\/?([a-zA-Z][\w:-]*)/);
+
     if (!tagMatch) continue;
 
     const tag = tagMatch[1].toLowerCase();
@@ -131,12 +154,15 @@ function parseHtml(html) {
       for (let i = stack.length - 1; i >= 0; i--) {
         if (stack[i].tag === tag) {
           const node = stack[i];
+
           node.end = tokenPattern.lastIndex;
-          node.inner = String(html).slice(node.openEnd, match.index);
+          node.inner = source.slice(node.openEnd, match.index);
+
           stack.length = i;
           break;
         }
       }
+
       continue;
     }
 
@@ -147,33 +173,40 @@ function parseHtml(html) {
       openEnd: tokenPattern.lastIndex,
       end: null,
       inner: "",
-      parent: stack.length ? stack[stack.length - 1] : null,
+      parent: stack.length
+        ? stack[stack.length - 1]
+        : null,
       children: []
     };
 
-    if (node.parent) node.parent.children.push(node);
+    if (node.parent) {
+      node.parent.children.push(node);
+    }
+
     nodes.push(node);
 
-    if (!voidTags.has(tag) && !/\/\s*>$/.test(token)) {
+    if (
+      !voidTags.has(tag) &&
+      !/\/\s*>$/.test(token)
+    ) {
       stack.push(node);
     } else {
       node.end = tokenPattern.lastIndex;
     }
   }
 
-  const htmlLength = String(html || "").length;
-
   for (const node of stack) {
-    node.end = htmlLength;
-    node.inner = String(html).slice(node.openEnd);
+    node.end = source.length;
+    node.inner = source.slice(node.openEnd);
   }
 
   return nodes;
 }
 
 function hasClass(node, className) {
-  const classes = getAttribute(node.attrs, "class").split(/\s+/);
-  return classes.includes(className);
+  return getAttribute(node.attrs, "class")
+    .split(/\s+/)
+    .includes(className);
 }
 
 function descendants(node, predicate) {
@@ -181,7 +214,10 @@ function descendants(node, predicate) {
 
   function visit(current) {
     for (const child of current.children || []) {
-      if (predicate(child)) found.push(child);
+      if (predicate(child)) {
+        found.push(child);
+      }
+
       visit(child);
     }
   }
@@ -203,8 +239,13 @@ function firstNode(nodes, predicate) {
 }
 
 function getNodeUrl(node, attribute, base) {
-  return absoluteUrl(getAttribute(node.attrs, attribute), base);
+  return absoluteUrl(
+    getAttribute(node.attrs, attribute),
+    base
+  );
 }
+
+/* -------------------- AlooyTV domain -------------------- */
 
 async function getAlooyDomain() {
   if (cachedDomain) return cachedDomain;
@@ -216,23 +257,143 @@ async function getAlooyDomain() {
     for (const link of links) {
       const href = getAttribute(link, "href");
 
-      if (/alooytv/i.test(href) && /\.xyz(?:[/:?#]|$)/i.test(href)) {
+      if (
+        /alooytv/i.test(href) &&
+        /\.xyz(?:[/:?#]|$)/i.test(href)
+      ) {
         const absolute = absoluteUrl(href, result.url);
-        const match = absolute.match(/^(https?:\/\/[^/]+)/i);
+        const match = absolute.match(
+          /^(https?:\/\/[^/]+)/i
+        );
 
         if (match) {
           cachedDomain = match[1];
+
+          console.log(
+            "[Z3ter] Discovered AlooyTV domain:",
+            cachedDomain
+          );
+
           return cachedDomain;
         }
       }
     }
-  } catch (_) {
-    // Use the same fallback domain as the original CloudStream provider.
+  } catch (error) {
+    console.error(
+      "[Z3ter] Domain discovery failed:",
+      error && error.message
+        ? error.message
+        : String(error)
+    );
   }
 
   cachedDomain = ALOOY_FALLBACK;
+
+  console.log(
+    "[Z3ter] Using fallback domain:",
+    cachedDomain
+  );
+
   return cachedDomain;
 }
+
+/* -------------------- TMDB titles -------------------- */
+
+function titleFromTmdbPage(html) {
+  const metaTags = String(html || "")
+    .match(/<meta\b[^>]*>/gi) || [];
+
+  for (const tag of metaTags) {
+    const property =
+      getAttribute(tag, "property").toLowerCase();
+
+    const name =
+      getAttribute(tag, "name").toLowerCase();
+
+    if (property === "og:title" || name === "title") {
+      const value = getAttribute(tag, "content")
+        .replace(
+          /\s*[|·]\s*The Movie Database.*$/i,
+          ""
+        )
+        .replace(
+          /\s*-\s*The Movie Database.*$/i,
+          ""
+        )
+        .trim();
+
+      if (value) return value;
+    }
+  }
+
+  const titleMatch = String(html || "").match(
+    /<title\b[^>]*>([\s\S]*?)<\/title>/i
+  );
+
+  if (!titleMatch) return "";
+
+  return stripTags(titleMatch[1])
+    .replace(
+      /\s*[|·]\s*The Movie Database.*$/i,
+      ""
+    )
+    .replace(
+      /\s*-\s*The Movie Database.*$/i,
+      ""
+    )
+    .trim();
+}
+
+async function getTmdbTitles(tmdbId, mediaType) {
+  const type = mediaType === "tv" ? "tv" : "movie";
+  const languages = ["ar-SA", "en-US"];
+  const titles = [];
+
+  for (const language of languages) {
+    const url =
+      "https://www.themoviedb.org/" +
+      type + "/" +
+      encodeURIComponent(String(tmdbId)) +
+      "?language=" + language;
+
+    try {
+      const result = await fetchText(url);
+      const title = titleFromTmdbPage(result.text);
+
+      if (
+        title &&
+        !titles.some(
+          existing =>
+            existing.toLowerCase() === title.toLowerCase()
+        )
+      ) {
+        titles.push(title);
+      }
+
+      console.log(
+        "[Z3ter] TMDB title (" + language + "):",
+        title || "(empty)"
+      );
+    } catch (error) {
+      console.error(
+        "[Z3ter] TMDB lookup failed (" + language + "):",
+        error && error.message
+          ? error.message
+          : String(error)
+      );
+    }
+  }
+
+  if (!titles.length) {
+    throw new Error(
+      "Could not resolve any TMDB title"
+    );
+  }
+
+  return titles;
+}
+
+/* -------------------- Search and matching -------------------- */
 
 function normalizeTitle(value) {
   return stripTags(value)
@@ -244,53 +405,13 @@ function normalizeTitle(value) {
     .replace(/\s+/g, " ");
 }
 
-function titleFromTmdbPage(html) {
-  const metaTags = html.match(/<meta\b[^>]*>/gi) || [];
-
-  for (const tag of metaTags) {
-    const property = getAttribute(tag, "property").toLowerCase();
-    const name = getAttribute(tag, "name").toLowerCase();
-
-    if (property === "og:title" || name === "title") {
-      const value = getAttribute(tag, "content")
-        .replace(/\s*[|·]\s*The Movie Database.*$/i, "")
-        .replace(/\s*-\s*The Movie Database.*$/i, "")
-        .trim();
-
-      if (value) return value;
-    }
-  }
-
-  const titleMatch = html.match(/<title\b[^>]*>([\s\S]*?)<\/title>/i);
-  if (!titleMatch) return "";
-
-  return stripTags(titleMatch[1])
-    .replace(/\s*[|·]\s*The Movie Database.*$/i, "")
-    .replace(/\s*-\s*The Movie Database.*$/i, "")
-    .trim();
-}
-
-async function getTmdbTitle(tmdbId, mediaType) {
-  const type = mediaType === "tv" ? "tv" : "movie";
-  const url =
-    "https://www.themoviedb.org/" +
-    type + "/" + encodeURIComponent(String(tmdbId)) +
-    "?language=en-US";
-
-  const result = await fetchText(url);
-  const title = titleFromTmdbPage(result.text);
-
-  if (!title) {
-    throw new Error("Could not resolve TMDB title");
-  }
-
-  return title;
-}
-
 function parseSearchResults(html, domain) {
   const nodes = parseHtml(html);
+
   const containers = nodes.filter(
-    node => node.tag === "div" && hasClass(node, "movie-container")
+    node =>
+      node.tag === "div" &&
+      hasClass(node, "movie-container")
   );
 
   const results = [];
@@ -299,56 +420,48 @@ function parseSearchResults(html, domain) {
     for (const card of container.children || []) {
       if (card.tag !== "div") continue;
 
-      const cardNodes = [card, ...descendants(card, () => true)];
+      const cardNodes = [
+        card,
+        ...descendants(card, () => true)
+      ];
 
-      const anchor = firstNode(
+      const titleBox = firstNode(
         cardNodes,
         node =>
-          node.tag === "a" &&
-          cardNodes.some(
-            candidate =>
-              candidate.tag === "h3" &&
-              candidate.parent &&
-              hasClass(candidate.parent, "movie-title") &&
-              descendants(candidate.parent, n => n === node).length > 0
-          )
+          node.tag === "div" &&
+          hasClass(node, "movie-title")
       );
 
-      // Fallback to the actual selector structure used by AlooyTV:
-      // .movie-title h3 a
-      let titleAnchor = anchor;
+      if (!titleBox) continue;
 
-      if (!titleAnchor) {
-        const titleBox = firstNode(
-          cardNodes,
-          node => node.tag === "div" && hasClass(node, "movie-title")
-        );
+      const heading = firstNode(
+        descendants(titleBox, () => true),
+        node => node.tag === "h3"
+      );
 
-        if (titleBox) {
-          const heading = firstNode(
-            descendants(titleBox, () => true),
-            node => node.tag === "h3"
-          );
+      if (!heading) continue;
 
-          if (heading) {
-            titleAnchor = firstNode(
-              descendants(heading, () => true),
-              node => node.tag === "a"
-            );
-          }
-        }
-      }
+      const anchor = firstNode(
+        descendants(heading, () => true),
+        node => node.tag === "a"
+      );
 
-      if (!titleAnchor) continue;
+      if (!anchor) continue;
 
-      const title = nodeText(titleAnchor);
-      const url = getNodeUrl(titleAnchor, "href", domain);
+      const title = nodeText(anchor);
+      const url = getNodeUrl(
+        anchor,
+        "href",
+        domain
+      );
 
       if (!title || !url) continue;
 
       const image = firstNode(
         cardNodes,
-        node => node.tag === "img" && hasClass(node, "lazy")
+        node =>
+          node.tag === "img" &&
+          hasClass(node, "lazy")
       );
 
       const poster = image
@@ -359,7 +472,11 @@ function parseSearchResults(html, domain) {
           )
         : "";
 
-      results.push({ title, url, poster });
+      results.push({
+        title,
+        url,
+        poster
+      });
     }
   }
 
@@ -368,6 +485,7 @@ function parseSearchResults(html, domain) {
 
 function chooseBestResult(results, targetTitle) {
   const target = normalizeTitle(targetTitle);
+
   if (!target) return null;
 
   let best = null;
@@ -375,6 +493,7 @@ function chooseBestResult(results, targetTitle) {
 
   for (const result of results) {
     const candidate = normalizeTitle(result.title);
+
     if (!candidate) continue;
 
     let score = 0;
@@ -387,10 +506,18 @@ function chooseBestResult(results, targetTitle) {
     ) {
       score = 75;
     } else {
-      const targetWords = target.split(" ").filter(Boolean);
-      const candidateWords = new Set(candidate.split(" ").filter(Boolean));
+      const targetWords = target
+        .split(" ")
+        .filter(Boolean);
 
-      const common = targetWords.filter(word => candidateWords.has(word));
+      const candidateWords = new Set(
+        candidate.split(" ").filter(Boolean)
+      );
+
+      const common = targetWords.filter(
+        word => candidateWords.has(word)
+      );
+
       score = targetWords.length
         ? (common.length / targetWords.length) * 60
         : 0;
@@ -402,18 +529,28 @@ function chooseBestResult(results, targetTitle) {
     }
   }
 
-  // Avoid selecting an unrelated title just because it was the closest.
   return bestScore >= 45 ? best : null;
 }
 
 async function searchAlooy(title, domain) {
-  const url = domain + "/search?q=" + encodeURIComponent(title);
+  const url =
+    domain +
+    "/search?q=" +
+    encodeURIComponent(title);
+
   const result = await fetchText(url);
-  return parseSearchResults(result.text, domain);
+
+  return parseSearchResults(
+    result.text,
+    result.url || domain
+  );
 }
+
+/* -------------------- Episode selection -------------------- */
 
 function getEpisodeNumber(label) {
   const text = stripTags(label);
+
   const patterns = [
     /(?:episode|ep|الحلقة|حلقة|الحلقه)\s*[-:#]?\s*(\d+)/i,
     /^\s*(\d+)\s*$/
@@ -421,40 +558,73 @@ function getEpisodeNumber(label) {
 
   for (const pattern of patterns) {
     const match = text.match(pattern);
-    if (match) return Number(match[1]);
+
+    if (match) {
+      return Number(match[1]);
+    }
   }
 
   return null;
 }
 
-async function getEpisodeUrl(seriesUrl, season, episode) {
+async function getEpisodeUrl(
+  seriesUrl,
+  season,
+  episode
+) {
   const result = await fetchText(seriesUrl);
   const nodes = parseHtml(result.text);
 
   const episodeLinks = nodes.filter(
-    node => node.tag === "a" && hasClass(node, "btn-ep")
+    node =>
+      node.tag === "a" &&
+      hasClass(node, "btn-ep")
   );
 
-  if (!episodeLinks.length) return seriesUrl;
+  if (!episodeLinks.length) {
+    console.log(
+      "[Z3ter] No episode links found; using series page."
+    );
+
+    return seriesUrl;
+  }
 
   const wantedEpisode = Number(episode);
-  const wantedSeason = Number(season);
 
-  const candidates = episodeLinks.map(node => ({
-    label: nodeText(node),
-    url: getNodeUrl(node, "href", result.url)
-  })).filter(item => item.url);
+  const candidates = episodeLinks
+    .map(node => ({
+      label: nodeText(node),
+      url: getNodeUrl(
+        node,
+        "href",
+        result.url || seriesUrl
+      )
+    }))
+    .filter(item => item.url);
 
-  let matches = candidates.filter(
-    item => getEpisodeNumber(item.label) === wantedEpisode
+  console.log(
+    "[Z3ter] Episode links found:",
+    candidates.length
   );
 
-  if (matches.length === 1) return matches[0].url;
+  let matches = candidates.filter(
+    item =>
+      getEpisodeNumber(item.label) === wantedEpisode
+  );
 
-  // Some pages include season information in the episode label.
-  if (matches.length > 1 && Number.isFinite(wantedSeason)) {
+  if (matches.length === 1) {
+    return matches[0].url;
+  }
+
+  const wantedSeason = Number(season);
+
+  if (
+    matches.length > 1 &&
+    Number.isFinite(wantedSeason)
+  ) {
     const seasonMatches = matches.filter(item => {
       const text = normalizeTitle(item.label);
+
       return (
         text.includes("season " + wantedSeason) ||
         text.includes("الموسم " + wantedSeason) ||
@@ -462,52 +632,106 @@ async function getEpisodeUrl(seriesUrl, season, episode) {
       );
     });
 
-    if (seasonMatches.length === 1) return seasonMatches[0].url;
+    if (seasonMatches.length === 1) {
+      return seasonMatches[0].url;
+    }
   }
 
-  // Do not silently play a different episode when the match is ambiguous.
   if (matches.length > 1) {
-    throw new Error("Multiple episodes match episode " + wantedEpisode);
+    throw new Error(
+      "Multiple links match episode " +
+      wantedEpisode
+    );
   }
 
-  // No exact episode label was found. If there's only one link, it is safe
-  // to use; otherwise avoid guessing which episode the user requested.
-  if (candidates.length === 1) return candidates[0].url;
+  if (candidates.length === 1) {
+    return candidates[0].url;
+  }
 
-  throw new Error("Requested episode was not found on the series page");
+  throw new Error(
+    "Requested episode " +
+    wantedEpisode +
+    " was not found"
+  );
 }
+
+/* -------------------- Stream extraction -------------------- */
 
 async function extractStreams(pageUrl, domain) {
   const result = await fetchText(pageUrl);
   const nodes = parseHtml(result.text);
 
-  const sources = nodes.filter(node => node.tag === "source");
+  const sources = nodes.filter(
+    node => node.tag === "source"
+  );
+
   const streams = [];
+
+  console.log(
+    "[Z3ter] Source elements found:",
+    sources.length
+  );
 
   for (const source of sources) {
     const parent = source.parent;
 
-    // Match the original selector: video source
-    if (!parent || parent.tag !== "video") continue;
+    // Match the original CloudStream selector:
+    // video source
+    if (!parent || parent.tag !== "video") {
+      continue;
+    }
 
     const url = absoluteUrl(
       getAttribute(source.attrs, "src"),
-      result.url
+      result.url || pageUrl
     );
 
-    if (!url || !/^https?:\/\//i.test(url)) continue;
+    if (!url || !/^https?:\/\//i.test(url)) {
+      continue;
+    }
 
-    const type = getAttribute(source.attrs, "type").toLowerCase();
+    const type = getAttribute(
+      source.attrs,
+      "type"
+    ).toLowerCase();
+
     const lowerUrl = url.toLowerCase();
 
     let quality = "auto";
-    if (/1080/.test(lowerUrl)) quality = "1080p";
-    else if (/720/.test(lowerUrl)) quality = "720p";
-    else if (/480/.test(lowerUrl)) quality = "480p";
+
+    if (/1080/.test(lowerUrl)) {
+      quality = "1080p";
+    } else if (/720/.test(lowerUrl)) {
+      quality = "720p";
+    } else if (/480/.test(lowerUrl)) {
+      quality = "480p";
+    }
+
+    let format = "";
+
+    if (
+      /\.m3u8(?:$|[?#])/i.test(url) ||
+      type.includes("mpegurl")
+    ) {
+      format = "HLS";
+    } else if (
+      /\.mpd(?:$|[?#])/i.test(url) ||
+      type.includes("dash")
+    ) {
+      format = "DASH";
+    } else if (
+      /\.mp4(?:$|[?#])/i.test(url) ||
+      type.includes("mp4")
+    ) {
+      format = "MP4";
+    }
 
     streams.push({
       name: PROVIDER_NAME + " - AlooyTV",
-      title: "AlooyTV | " + quality,
+      title:
+        "AlooyTV | " +
+        quality +
+        (format ? " | " + format : ""),
       url,
       quality,
       headers: {
@@ -517,48 +741,175 @@ async function extractStreams(pageUrl, domain) {
     });
   }
 
-  // Remove duplicate stream URLs.
-  return streams.filter(
+  const uniqueStreams = streams.filter(
     (stream, index, all) =>
-      all.findIndex(item => item.url === stream.url) === index
+      all.findIndex(
+        item => item.url === stream.url
+      ) === index
   );
+
+  console.log(
+    "[Z3ter] Valid streams extracted:",
+    uniqueStreams.length
+  );
+
+  return uniqueStreams;
 }
 
-async function getStreams(tmdbId, mediaType, season, episode) {
+/* -------------------- Nuvio entry point -------------------- */
+
+async function getStreams(
+  tmdbId,
+  mediaType,
+  season,
+  episode
+) {
+  let stage = "validation";
+
   try {
-    if (!tmdbId || !["movie", "tv"].includes(mediaType)) return [];
+    if (
+      !tmdbId ||
+      !["movie", "tv"].includes(mediaType)
+    ) {
+      console.log(
+        "[Z3ter] Invalid input:",
+        { tmdbId, mediaType, season, episode }
+      );
 
-    const domain = await getAlooyDomain();
-    const title = await getTmdbTitle(tmdbId, mediaType);
-    const results = await searchAlooy(title, domain);
-    const match = chooseBestResult(results, title);
-
-    if (!match) {
-      console.log("[Z3ter Provider] AlooyTV title not found:", title);
       return [];
     }
+
+    stage = "domain discovery";
+
+    const domain = await getAlooyDomain();
+
+    console.log(
+      "[Z3ter] Active domain:",
+      domain
+    );
+
+    stage = "TMDB title lookup";
+
+    const titles = await getTmdbTitles(
+      tmdbId,
+      mediaType
+    );
+
+    console.log(
+      "[Z3ter] Titles to search:",
+      titles
+    );
+
+    let match = null;
+    let matchedTitle = "";
+
+    stage = "AlooyTV search";
+
+    for (const title of titles) {
+      console.log(
+        "[Z3ter] Searching:",
+        title
+      );
+
+      const results = await searchAlooy(
+        title,
+        domain
+      );
+
+      console.log(
+        "[Z3ter] Search results for",
+        title + ":",
+        results.length
+      );
+
+      const candidate = chooseBestResult(
+        results,
+        title
+      );
+
+      if (candidate) {
+        match = candidate;
+        matchedTitle = title;
+        break;
+      }
+    }
+
+    if (!match) {
+      console.log(
+        "[Z3ter] No matching title found on AlooyTV."
+      );
+
+      return [];
+    }
+
+    console.log(
+      "[Z3ter] Selected title:",
+      match.title
+    );
+
+    console.log(
+      "[Z3ter] Matched using:",
+      matchedTitle
+    );
+
+    console.log(
+      "[Z3ter] Content page:",
+      match.url
+    );
 
     let playbackPage = match.url;
 
     if (mediaType === "tv") {
-      if (episode == null) return [];
+      stage = "episode selection";
+
+      if (episode == null) {
+        console.log(
+          "[Z3ter] TV request is missing the episode number."
+        );
+
+        return [];
+      }
 
       playbackPage = await getEpisodeUrl(
         match.url,
         season,
         episode
       );
+
+      console.log(
+        "[Z3ter] Selected episode page:",
+        playbackPage
+      );
     }
 
-    return await extractStreams(playbackPage, domain);
+    stage = "stream extraction";
+
+    const streams = await extractStreams(
+      playbackPage,
+      domain
+    );
+
+    console.log(
+      "[Z3ter] Finished. Stream count:",
+      streams.length
+    );
+
+    return streams;
   } catch (error) {
     console.error(
-      "[Z3ter Provider] AlooyTV error:",
-      error && error.message ? error.message : String(error)
+      "[Z3ter] Failed at stage:",
+      stage,
+      "| Error:",
+      error && error.message
+        ? error.message
+        : String(error)
     );
 
     return [];
   }
 }
 
-module.exports = { getStreams };
+module.exports = {
+  getStreams
+};
+    
