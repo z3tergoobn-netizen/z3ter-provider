@@ -1,4 +1,3 @@
-
 //
 // ©© made by AI
 //
@@ -374,7 +373,7 @@ function getQualityInfo(value, url) {
     let label;
     if (resolution >= 2160) label = "4K UHD";
     else if (resolution >= 1440) label = "QHD";
-    else if (resolution >= 1080) label = "Full HD";
+    else if (resolution >= 1080) label = "FHD";
     else if (resolution >= 720) label = "HD";
     else label = "SD";
 
@@ -385,27 +384,51 @@ function getQualityInfo(value, url) {
     };
   }
 
-  if (/\b(?:4k|uhd|ultra[\s-]*hd)\b/i.test(source)) {
-    return { resolution: 2160, quality: "4K UHD", label: "4K UHD" };
+  if (/\b(?:4k|uhd|ultra[\s-]*hd)\b/i.test(combined)) {
+    return {
+      resolution: 2160,
+      quality: "2160p",
+      label: "4K UHD"
+    };
   }
 
-  if (/\b(?:fhd|full[\s-]*hd)\b/i.test(source)) {
-    return { resolution: 1080, quality: "Full HD", label: "Full HD" };
+  if (/\b(?:fhd|full[\s-]*hd)\b/i.test(combined)) {
+    return {
+      resolution: 1080,
+      quality: "1080p",
+      label: "FHD"
+    };
   }
 
-  if (/\bqhd\b/i.test(source)) {
-    return { resolution: 1440, quality: "QHD", label: "QHD" };
+  if (/\bqhd\b/i.test(combined)) {
+    return {
+      resolution: 1440,
+      quality: "1440p",
+      label: "QHD"
+    };
   }
 
-  if (/\bhd\b/i.test(source)) {
-    return { resolution: 0, quality: "HD", label: "HD" };
+  if (/\bhd\b/i.test(combined)) {
+    return {
+      resolution: 0,
+      quality: "HD",
+      label: "HD"
+    };
   }
 
-  if (/\b(?:sd|low|mobile)\b/i.test(source)) {
-    return { resolution: 480, quality: "SD", label: "SD" };
+  if (/\b(?:sd|low|mobile)\b/i.test(combined)) {
+    return {
+      resolution: 480,
+      quality: "480p",
+      label: "SD"
+    };
   }
 
-  return { resolution: 0, quality: "Auto", label: "Auto / Unknown" };
+  return {
+    resolution: 0,
+    quality: "Auto",
+    label: "Auto"
+  };
 }
 
 function qualityRank(stream) {
@@ -414,8 +437,12 @@ function qualityRank(stream) {
 
 function getQualityEmoji(resolution) {
   if (resolution >= 2160) return "👑";
+  if (resolution >= 1440) return "💎";
   if (resolution >= 1080) return "⚡";
   if (resolution >= 720) return "🔥";
+  if (resolution >= 576) return "🎯";
+  if (resolution >= 540) return "🟣";
+  if (resolution >= 480) return "📺";
   if (resolution > 0) return "📱";
   return "❔";
 }
@@ -485,12 +512,8 @@ async function extractStreams(detail) {
     const emoji = getQualityEmoji(info.resolution);
 
     streams.push({
-      name: PROVIDER_NAME,
-      title:
-        emoji + " " + info.label +
-        " | 📺 " + info.quality +
-        " · " + format +
-        " | 🎬 " + item.server,
+      name: emoji + " " + info.label + " | 👴🏻✌🏻515",
+      title: "🎬 Oscar TV · 🎞️ " + info.quality,
       url,
       quality: info.quality,
       resolution: info.resolution,
