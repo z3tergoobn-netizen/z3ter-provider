@@ -1,4 +1,8 @@
 
+//
+// ©© made by AI
+//
+
 "use strict";
 
 const PROVIDER_NAME = "Oscar TV";
@@ -91,10 +95,8 @@ async function cached(key, loader, ttl = CACHE_TTL) {
   }
 }
 
-/*
- * Oscar requires fresh X-Iron-* headers for API requests.
- * The helper prepares headers for the exact URL being requested.
- */
+/* -------------------- Oscar API -------------------- */
+
 async function oscarCall(path) {
   const url =
     OSCAR_HOME + "/" + String(path).replace(/^\/+/, "");
@@ -128,13 +130,11 @@ async function oscarCall(path) {
     headers["Accept"] =
       headers["Accept"] || "application/json, text/plain, */*";
 
-    const result = await fetchJson(url, {
+    return fetchJson(url, {
       method: "GET",
       headers,
       redirect: "follow"
     });
-
-    return result;
   });
 }
 
@@ -342,31 +342,85 @@ async function findBestMatch(titles, mediaType) {
 
   log("Candidates:", results.length, "best score:", bestScore);
 
-  // Avoid selecting an unrelated work when titles are too different.
   return bestScore >= 45
     ? { ...best, score: bestScore }
     : null;
 }
 
-/* -------------------- Stream extraction -------------------- */
+/* -------------------- Stream formatting -------------------- */
 
 function getFormat(url) {
-  const value = String(url).toLowerCase();
+  const value = String(url || "").toLowerCase();
 
   if (/\.m3u8(?:$|[?#])/.test(value)) return "HLS";
   if (/\.mpd(?:$|[?#])/.test(value)) return "DASH";
   if (/\.mp4(?:$|[?#])/.test(value)) return "MP4";
+  if (/\.mkv(?:$|[?#])/.test(value)) return "MKV";
 
   return "Direct";
 }
 
-function getQuality(value, url) {
-  const match = (clean(value) + " " + url).match(
+function getQualityInfo(value, url) {
+  const source = clean(value);
+  const combined = source + " " + String(url || "");
+
+  const match = combined.match(
     /(?:^|\D)(2160|1440|1080|720|576|540|480|360)p?(?:\D|$)/i
   );
 
-  return match ? match[1] + "p" : (clean(value) || "auto");
+  if (match) {
+    const resolution = Number(match[1]);
+
+    let label;
+    if (resolution >= 2160) label = "4K UHD";
+    else if (resolution >= 1440) label = "QHD";
+    else if (resolution >= 1080) label = "Full HD";
+    else if (resolution >= 720) label = "HD";
+    else label = "SD";
+
+    return {
+      resolution,
+      quality: resolution + "p",
+      label
+    };
+  }
+
+  if (/\b(?:4k|uhd|ultra[\s-]*hd)\b/i.test(source)) {
+    return { resolution: 2160, quality: "4K UHD", label: "4K UHD" };
+  }
+
+  if (/\b(?:fhd|full[\s-]*hd)\b/i.test(source)) {
+    return { resolution: 1080, quality: "Full HD", label: "Full HD" };
+  }
+
+  if (/\bqhd\b/i.test(source)) {
+    return { resolution: 1440, quality: "QHD", label: "QHD" };
+  }
+
+  if (/\bhd\b/i.test(source)) {
+    return { resolution: 0, quality: "HD", label: "HD" };
+  }
+
+  if (/\b(?:sd|low|mobile)\b/i.test(source)) {
+    return { resolution: 480, quality: "SD", label: "SD" };
+  }
+
+  return { resolution: 0, quality: "Auto", label: "Auto / Unknown" };
 }
+
+function qualityRank(stream) {
+  return Number(stream?.resolution) || -1;
+}
+
+function getQualityEmoji(resolution) {
+  if (resolution >= 2160) return "👑";
+  if (resolution >= 1080) return "⚡";
+  if (resolution >= 720) return "🔥";
+  if (resolution > 0) return "📱";
+  return "❔";
+}
+
+/* -------------------- Stream extraction -------------------- */
 
 async function resolveSpecialHost(url) {
   if (!url.includes("newcdn.seriesmp4.com")) return url;
@@ -427,22 +481,27 @@ async function extractStreams(detail) {
     seen.add(url);
 
     const format = getFormat(url);
-    const quality = getQuality(item.quality, url);
+    const info = getQualityInfo(item.quality, url);
+    const emoji = getQualityEmoji(info.resolution);
 
     streams.push({
       name: PROVIDER_NAME,
       title:
-        "Oscar TV | " + item.server +
-        " | " + quality +
-        (format !== "Direct" ? " | " + format : ""),
+        emoji + " " + info.label +
+        " | 📺 " + info.quality +
+        " · " + format +
+        " | 🎬 " + item.server,
       url,
-      quality,
+      quality: info.quality,
+      resolution: info.resolution,
       headers: {
         "User-Agent": PLAY_UA,
         "Referer": OSCAR_HOME + "/"
       }
     });
   }
+
+  streams.sort((a, b) => qualityRank(b) - qualityRank(a));
 
   return streams;
 }
