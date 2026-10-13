@@ -1,21 +1,18 @@
-
 "use strict";
 
 /**
  ©© This project is just a test made by AI
  * Z3ter Provider - AlooyTV
- * Nuvio contract: getStreams(tmdbId, mediaType, season, episode)
- *
- * Adapted from:
- * https://github.com/mo7AmMeD64/cs-ar/tree/main/Alooytv
- *
- * Supports Arabic and English title searches.
- * Uses global fetch. No Node.js built-ins or external packages.
+ * Nuvio: getStreams(tmdbId, mediaType, season, episode)
+ * TMDB API + optional elCinema aliases + flexible AlooyTV search.
  */
 
 const PROVIDER_NAME = "Z3ter Provider";
 const ALOOY_HOME = "https://fitnur.com/alooytv";
 const ALOOY_FALLBACK = "https://n.alooytv14.xyz";
+const ELCINEMA_SEARCH = "https://elcinema.com/search/work/";
+
+const TMDB_API_KEY = "09c002491851747716f94bd211a6681b";
 
 const USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
@@ -24,7 +21,7 @@ const USER_AGENT =
 
 let cachedDomain = null;
 
-/* -------------------- HTML utilities -------------------- */
+/* -------------------- Text utilities -------------------- */
 
 function decodeHtml(value) {
   return String(value || "")
@@ -33,13 +30,13 @@ function decodeHtml(value) {
     .replace(/&#39;|&apos;/gi, "'")
     .replace(/&lt;/gi, "<")
     .replace(/&gt;/gi, ">")
+    .replace(/&nbsp;/gi, " ")
     .replace(/&#(\d+);/g, (_, n) =>
       String.fromCharCode(Number(n))
     )
     .replace(/&#x([0-9a-f]+);/gi, (_, n) =>
       String.fromCharCode(parseInt(n, 16))
-    )
-    .replace(/&nbsp;/gi, " ");
+    );
 }
 
 function stripTags(value) {
@@ -48,14 +45,11 @@ function stripTags(value) {
       .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ")
       .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ")
       .replace(/<[^>]*>/g, " ")
-  )
-    .replace(/\s+/g, " ")
-    .trim();
+  ).replace(/\s+/g, " ").trim();
 }
 
 function getAttribute(tag, name) {
   const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-
   const match = String(tag || "").match(
     new RegExp(
       "\\b" + escaped +
@@ -72,15 +66,7 @@ function getAttribute(tag, name) {
 function absoluteUrl(url, base) {
   const value = decodeHtml(String(url || "").trim());
 
-  if (!value) return "";
-
-  if (/^(https?:)?\/\//i.test(value)) {
-    return value.startsWith("//")
-      ? "https:" + value
-      : value;
-  }
-
-  if (/^(data:|blob:|javascript:)/i.test(value)) {
+  if (!value || /^(data:|blob:|javascript:)/i.test(value)) {
     return "";
   }
 
@@ -91,24 +77,32 @@ function absoluteUrl(url, base) {
   }
 }
 
-async function fetchText(url, options = {}) {
+function normalizeTitle(value) {
+  return stripTags(value)
+    .toLowerCase()
+    .replace(/[\u064B-\u065F\u0670ـ]/g, "")
+    .replace(/[أإآٱ]/g, "ا")
+    .replace(/ى/g, "ي")
+    .replace(/\b(?:مدبلج|مترجم|كامل|حصريا|الحلقه|الحلقة)\b/g, " ")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+/* -------------------- HTTP -------------------- */
+
+async function fetchText(url) {
   const response = await fetch(url, {
-    method: options.method || "GET",
     headers: {
       "User-Agent": USER_AGENT,
-      "Accept":
-        "text/html,application/xhtml+xml,application/json,*/*",
-      "Accept-Language": "ar,en;q=0.9",
-      ...(options.headers || {})
+      "Accept": "text/html,application/xhtml+xml,application/json,*/*",
+      "Accept-Language": "ar,en;q=0.9"
     },
-    body: options.body,
     redirect: "follow"
   });
 
   if (!response.ok) {
-    throw new Error(
-      "HTTP " + response.status + " for " + url
-    );
+    throw new Error("HTTP " + response.status + " for " + url);
   }
 
   return {
@@ -118,7 +112,7 @@ async function fetchText(url, options = {}) {
   };
 }
 
-/* -------------------- HTML parser -------------------- */
+/* -------------------- Simple HTML parser -------------------- */
 
 function parseHtml(html) {
   const source = String(html || "");
@@ -153,16 +147,12 @@ function parseHtml(html) {
     if (closing) {
       for (let i = stack.length - 1; i >= 0; i--) {
         if (stack[i].tag === tag) {
-          const node = stack[i];
-
-          node.end = tokenPattern.lastIndex;
-          node.inner = source.slice(node.openEnd, match.index);
-
+          stack[i].end = tokenPattern.lastIndex;
+          stack[i].inner = source.slice(stack[i].openEnd, match.index);
           stack.length = i;
           break;
         }
       }
-
       continue;
     }
 
@@ -173,22 +163,14 @@ function parseHtml(html) {
       openEnd: tokenPattern.lastIndex,
       end: null,
       inner: "",
-      parent: stack.length
-        ? stack[stack.length - 1]
-        : null,
+      parent: stack.length ? stack[stack.length - 1] : null,
       children: []
     };
 
-    if (node.parent) {
-      node.parent.children.push(node);
-    }
-
+    if (node.parent) node.parent.children.push(node);
     nodes.push(node);
 
-    if (
-      !voidTags.has(tag) &&
-      !/\/\s*>$/.test(token)
-    ) {
+    if (!voidTags.has(tag) && !/\/\s*>$/.test(token)) {
       stack.push(node);
     } else {
       node.end = tokenPattern.lastIndex;
@@ -214,10 +196,7 @@ function descendants(node, predicate) {
 
   function visit(current) {
     for (const child of current.children || []) {
-      if (predicate(child)) {
-        found.push(child);
-      }
-
+      if (predicate(child)) found.push(child);
       visit(child);
     }
   }
@@ -226,23 +205,12 @@ function descendants(node, predicate) {
   return found;
 }
 
-function innerHtml(node) {
-  return node && node.inner ? node.inner : "";
-}
-
 function nodeText(node) {
-  return stripTags(innerHtml(node));
-}
-
-function firstNode(nodes, predicate) {
-  return nodes.find(predicate) || null;
+  return stripTags(node && node.inner || "");
 }
 
 function getNodeUrl(node, attribute, base) {
-  return absoluteUrl(
-    getAttribute(node.attrs, attribute),
-    base
-  );
+  return absoluteUrl(getAttribute(node.attrs, attribute), base);
 }
 
 /* -------------------- AlooyTV domain -------------------- */
@@ -251,29 +219,22 @@ async function getAlooyDomain() {
   if (cachedDomain) return cachedDomain;
 
   try {
-    const result = await fetchText(ALOOY_HOME);
-    const links = result.text.match(/<a\b[^>]*>/gi) || [];
+    const page = await fetchText(ALOOY_HOME);
+    const anchors = page.text.match(/<a\b[^>]*>/gi) || [];
 
-    for (const link of links) {
-      const href = getAttribute(link, "href");
+    for (const anchor of anchors) {
+      const href = getAttribute(anchor, "href");
 
       if (
         /alooytv/i.test(href) &&
         /\.xyz(?:[/:?#]|$)/i.test(href)
       ) {
-        const absolute = absoluteUrl(href, result.url);
-        const match = absolute.match(
-          /^(https?:\/\/[^/]+)/i
-        );
+        const url = absoluteUrl(href, page.url);
+        const match = url.match(/^(https?:\/\/[^/]+)/i);
 
         if (match) {
           cachedDomain = match[1];
-
-          console.log(
-            "[Z3ter] Discovered AlooyTV domain:",
-            cachedDomain
-          );
-
+          console.log("[Z3ter] AlooyTV domain:", cachedDomain);
           return cachedDomain;
         }
       }
@@ -281,269 +242,338 @@ async function getAlooyDomain() {
   } catch (error) {
     console.error(
       "[Z3ter] Domain discovery failed:",
-      error && error.message
-        ? error.message
-        : String(error)
+      error.message || String(error)
     );
   }
 
   cachedDomain = ALOOY_FALLBACK;
-
-  console.log(
-    "[Z3ter] Using fallback domain:",
-    cachedDomain
-  );
-
+  console.log("[Z3ter] Using fallback domain:", cachedDomain);
   return cachedDomain;
 }
 
-/* -------------------- TMDB titles -------------------- */
+/* -------------------- TMDB official API -------------------- */
 
-function titleFromTmdbPage(html) {
-  const metaTags = String(html || "")
-    .match(/<meta\b[^>]*>/gi) || [];
+async function tmdbJson(path, language) {
+  const url =
+    "https://api.themoviedb.org/3/" + path +
+    "?api_key=" + encodeURIComponent(TMDB_API_KEY) +
+    "&language=" + encodeURIComponent(language);
 
-  for (const tag of metaTags) {
-    const property =
-      getAttribute(tag, "property").toLowerCase();
+  const response = await fetch(url, {
+    headers: {
+      "Accept": "application/json",
+      "User-Agent": USER_AGENT
+    },
+    redirect: "follow"
+  });
 
-    const name =
-      getAttribute(tag, "name").toLowerCase();
-
-    if (property === "og:title" || name === "title") {
-      const value = getAttribute(tag, "content")
-        .replace(
-          /\s*[|·]\s*The Movie Database.*$/i,
-          ""
-        )
-        .replace(
-          /\s*-\s*The Movie Database.*$/i,
-          ""
-        )
-        .trim();
-
-      if (value) return value;
-    }
+  if (!response.ok) {
+    throw new Error(
+      "TMDB API HTTP " + response.status + " for " + path
+    );
   }
 
-  const titleMatch = String(html || "").match(
-    /<title\b[^>]*>([\s\S]*?)<\/title>/i
-  );
-
-  if (!titleMatch) return "";
-
-  return stripTags(titleMatch[1])
-    .replace(
-      /\s*[|·]\s*The Movie Database.*$/i,
-      ""
-    )
-    .replace(
-      /\s*-\s*The Movie Database.*$/i,
-      ""
-    )
-    .trim();
+  return response.json();
 }
 
 async function getTmdbTitles(tmdbId, mediaType) {
   const type = mediaType === "tv" ? "tv" : "movie";
-  const languages = ["ar-SA", "en-US"];
+  const id = encodeURIComponent(String(tmdbId));
   const titles = [];
 
-  for (const language of languages) {
-    const url =
-      "https://www.themoviedb.org/" +
-      type + "/" +
-      encodeURIComponent(String(tmdbId)) +
-      "?language=" + language;
+  function addTitle(value) {
+    const title = stripTags(value || "").trim();
 
+    if (
+      title &&
+      !titles.some(
+        existing =>
+          normalizeTitle(existing) === normalizeTitle(title)
+      )
+    ) {
+      titles.push(title);
+    }
+  }
+
+  // العناوين العربية والإنجليزية والاسم الأصلي.
+  for (const language of ["ar-SA", "en-US"]) {
     try {
-      const result = await fetchText(url);
-      const title = titleFromTmdbPage(result.text);
+      const data = await tmdbJson(type + "/" + id, language);
 
-      if (
-        title &&
-        !titles.some(
-          existing =>
-            existing.toLowerCase() === title.toLowerCase()
-        )
-      ) {
-        titles.push(title);
-      }
+      addTitle(type === "tv" ? data.name : data.title);
+      addTitle(type === "tv" ? data.original_name : data.original_title);
 
       console.log(
-        "[Z3ter] TMDB title (" + language + "):",
-        title || "(empty)"
+        "[Z3ter] TMDB " + language + ":",
+        type === "tv" ? data.name : data.title
       );
     } catch (error) {
       console.error(
-        "[Z3ter] TMDB lookup failed (" + language + "):",
-        error && error.message
-          ? error.message
-          : String(error)
+        "[Z3ter] TMDB lookup " + language + ":",
+        error.message || String(error)
       );
     }
   }
 
+  // أسماء بديلة من TMDB، إن توفرت.
+  try {
+    const data = await tmdbJson(
+      type + "/" + id + "/alternative_titles",
+      "en-US"
+    );
+
+    const alternatives =
+      type === "tv" ? (data.results || []) : (data.titles || []);
+
+    for (const item of alternatives) {
+      addTitle(item.title || item.name);
+    }
+  } catch (error) {
+    console.log(
+      "[Z3ter] TMDB alternative titles unavailable:",
+      error.message || String(error)
+    );
+  }
+
   if (!titles.length) {
     throw new Error(
-      "Could not resolve any TMDB title"
+      "TMDB returned no titles. Check the API key and TMDB ID."
     );
   }
 
   return titles;
 }
 
-/* -------------------- Search and matching -------------------- */
+/* -------------------- AlooyTV search -------------------- */
 
-function normalizeTitle(value) {
-  return stripTags(value)
-    .toLowerCase()
-    .replace(/[أإآ]/g, "ا")
-    .replace(/ى/g, "ي")
-    .replace(/[^\p{L}\p{N}]+/gu, " ")
-    .trim()
-    .replace(/\s+/g, " ");
+function isLikelyAlooyWorkUrl(url, baseUrl) {
+  try {
+    const parsed = new URL(url);
+    const base = new URL(baseUrl);
+
+    if (parsed.hostname !== base.hostname) return false;
+
+    if (
+      /\/search|\/category|\/genre|\/page\/|\/login|\/register|\/contact/i
+        .test(parsed.pathname)
+    ) {
+      return false;
+    }
+
+    return /\/watch\//i.test(parsed.pathname) ||
+      /\.html?$/i.test(parsed.pathname);
+  } catch (_) {
+    return false;
+  }
 }
 
-function parseSearchResults(html, domain) {
+function parseAlooyResults(html, baseUrl) {
   const nodes = parseHtml(html);
+  const results = [];
+  const seen = new Set();
 
+  function add(anchor, titleOverride, urlOverride) {
+    const title = stripTags(
+      titleOverride || nodeText(anchor) ||
+      getAttribute(anchor.attrs, "title")
+    );
+
+    const url = urlOverride ||
+      getNodeUrl(anchor, "href", baseUrl);
+
+    if (
+      !title ||
+      !url ||
+      !isLikelyAlooyWorkUrl(url, baseUrl)
+    ) {
+      return;
+    }
+
+    const key = url.split("#")[0];
+
+    if (seen.has(key)) return;
+    seen.add(key);
+
+    results.push({ title, url, poster: "" });
+  }
+
+  // أولًا: بنية بطاقات الموقع المعروفة.
   const containers = nodes.filter(
     node =>
       node.tag === "div" &&
       hasClass(node, "movie-container")
   );
 
-  const results = [];
-
   for (const container of containers) {
     for (const card of container.children || []) {
       if (card.tag !== "div") continue;
 
-      const cardNodes = [
-        card,
-        ...descendants(card, () => true)
-      ];
-
-      const titleBox = firstNode(
-        cardNodes,
+      const all = [card, ...descendants(card, () => true)];
+      const titleBox = all.find(
         node =>
           node.tag === "div" &&
           hasClass(node, "movie-title")
       );
 
-      if (!titleBox) continue;
+      const anchor = titleBox &&
+        descendants(titleBox, node => node.tag === "a")[0];
 
-      const heading = firstNode(
-        descendants(titleBox, () => true),
-        node => node.tag === "h3"
-      );
+      if (anchor) add(anchor);
+    }
+  }
 
-      if (!heading) continue;
+  // احتياط: قوالب HTML مختلفة للنتائج العربية.
+  if (!results.length) {
+    for (const anchor of nodes.filter(node => node.tag === "a")) {
+      const url = getNodeUrl(anchor, "href", baseUrl);
+      const title = nodeText(anchor) ||
+        getAttribute(anchor.attrs, "title");
 
-      const anchor = firstNode(
-        descendants(heading, () => true),
-        node => node.tag === "a"
-      );
-
-      if (!anchor) continue;
-
-      const title = nodeText(anchor);
-      const url = getNodeUrl(
-        anchor,
-        "href",
-        domain
-      );
-
-      if (!title || !url) continue;
-
-      const image = firstNode(
-        cardNodes,
-        node =>
-          node.tag === "img" &&
-          hasClass(node, "lazy")
-      );
-
-      const poster = image
-        ? absoluteUrl(
-            getAttribute(image.attrs, "data-src") ||
-            getAttribute(image.attrs, "src"),
-            domain
-          )
-        : "";
-
-      results.push({
-        title,
-        url,
-        poster
-      });
+      if (
+        url &&
+        title &&
+        isLikelyAlooyWorkUrl(url, baseUrl)
+      ) {
+        add(anchor, title, url);
+      }
     }
   }
 
   return results;
 }
 
-function chooseBestResult(results, targetTitle) {
+function scoreTitle(candidateTitle, targetTitle) {
+  const candidate = normalizeTitle(candidateTitle);
   const target = normalizeTitle(targetTitle);
 
-  if (!target) return null;
+  if (!candidate || !target) return 0;
+  if (candidate === target) return 100;
 
+  if (
+    candidate.startsWith(target) ||
+    target.startsWith(candidate)
+  ) {
+    return 82;
+  }
+
+  const targetWords = target.split(" ").filter(Boolean);
+  const candidateWords = new Set(
+    candidate.split(" ").filter(Boolean)
+  );
+
+  const common = targetWords.filter(
+    word => candidateWords.has(word)
+  );
+
+  return targetWords.length
+    ? (common.length / targetWords.length) * 70
+    : 0;
+}
+
+function chooseBestResult(results, targetTitles) {
   let best = null;
   let bestScore = 0;
 
   for (const result of results) {
-    const candidate = normalizeTitle(result.title);
+    for (const target of targetTitles) {
+      const score = scoreTitle(result.title, target);
 
-    if (!candidate) continue;
-
-    let score = 0;
-
-    if (candidate === target) {
-      score = 100;
-    } else if (
-      candidate.startsWith(target) ||
-      target.startsWith(candidate)
-    ) {
-      score = 75;
-    } else {
-      const targetWords = target
-        .split(" ")
-        .filter(Boolean);
-
-      const candidateWords = new Set(
-        candidate.split(" ").filter(Boolean)
-      );
-
-      const common = targetWords.filter(
-        word => candidateWords.has(word)
-      );
-
-      score = targetWords.length
-        ? (common.length / targetWords.length) * 60
-        : 0;
-    }
-
-    if (score > bestScore) {
-      best = result;
-      bestScore = score;
+      if (score > bestScore) {
+        best = result;
+        bestScore = score;
+      }
     }
   }
 
-  return bestScore >= 45 ? best : null;
+  return bestScore >= 45
+    ? { ...best, score: bestScore }
+    : null;
 }
 
 async function searchAlooy(title, domain) {
-  const url =
-    domain +
-    "/search?q=" +
-    encodeURIComponent(title);
-
-  const result = await fetchText(url);
-
-  return parseSearchResults(
-    result.text,
-    result.url || domain
+  const page = await fetchText(
+    domain + "/search?q=" + encodeURIComponent(title)
   );
+
+  const results = parseAlooyResults(
+    page.text,
+    page.url || domain
+  );
+
+  console.log(
+    "[Z3ter] Alooy results for",
+    title + ":",
+    results.length
+  );
+
+  return results;
+}
+
+/* -------------------- elCinema optional aliases -------------------- */
+
+// مصدر مساعد فقط. فشل البحث هنا لا يوقف المزود.
+async function getElcinemaAliases(query) {
+  try {
+    const page = await fetchText(
+      ELCINEMA_SEARCH + "?q=" + encodeURIComponent(query)
+    );
+
+    const nodes = parseHtml(page.text);
+    const aliases = [];
+    const seen = new Set();
+
+    for (const anchor of nodes.filter(node => node.tag === "a")) {
+      const url = getNodeUrl(
+        anchor,
+        "href",
+        page.url || ELCINEMA_SEARCH
+      );
+
+      const title = nodeText(anchor) ||
+        getAttribute(anchor.attrs, "title");
+
+      if (!url || !title) continue;
+
+      let parsed;
+
+      try {
+        parsed = new URL(url);
+      } catch (_) {
+        continue;
+      }
+
+      if (
+        !/(^|\.)elcinema\.com$/i.test(parsed.hostname) ||
+        !/\/work\/\d+\/?/i.test(parsed.pathname)
+      ) {
+        continue;
+      }
+
+      const normalized = normalizeTitle(title);
+
+      if (!normalized || seen.has(normalized)) continue;
+
+      seen.add(normalized);
+      aliases.push(title);
+
+      if (aliases.length >= 8) break;
+    }
+
+    console.log(
+      "[Z3ter] elCinema aliases for",
+      query + ":",
+      aliases.length
+    );
+
+    return aliases;
+  } catch (error) {
+    console.log(
+      "[Z3ter] elCinema unavailable:",
+      error.message || String(error)
+    );
+
+    return [];
+  }
 }
 
 /* -------------------- Episode selection -------------------- */
@@ -558,179 +588,128 @@ function getEpisodeNumber(label) {
 
   for (const pattern of patterns) {
     const match = text.match(pattern);
-
-    if (match) {
-      return Number(match[1]);
-    }
+    if (match) return Number(match[1]);
   }
 
   return null;
 }
 
-async function getEpisodeUrl(
-  seriesUrl,
-  season,
-  episode
-) {
-  const result = await fetchText(seriesUrl);
-  const nodes = parseHtml(result.text);
+async function getEpisodeUrl(seriesUrl, season, episode) {
+  const page = await fetchText(seriesUrl);
+  const nodes = parseHtml(page.text);
 
   const episodeLinks = nodes.filter(
     node =>
       node.tag === "a" &&
-      hasClass(node, "btn-ep")
+      (
+        hasClass(node, "btn-ep") ||
+        /episode|الحلقة|حلقة|الحلقه/i.test(nodeText(node))
+      )
   );
-
-  if (!episodeLinks.length) {
-    console.log(
-      "[Z3ter] No episode links found; using series page."
-    );
-
-    return seriesUrl;
-  }
-
-  const wantedEpisode = Number(episode);
 
   const candidates = episodeLinks
     .map(node => ({
       label: nodeText(node),
-      url: getNodeUrl(
-        node,
-        "href",
-        result.url || seriesUrl
-      )
+      url: getNodeUrl(node, "href", page.url || seriesUrl)
     }))
-    .filter(item => item.url);
+    .filter(
+      item =>
+        item.url &&
+        getEpisodeNumber(item.label) !== null
+    );
 
   console.log(
     "[Z3ter] Episode links found:",
     candidates.length
   );
 
-  let matches = candidates.filter(
-    item =>
-      getEpisodeNumber(item.label) === wantedEpisode
+  const wanted = Number(episode);
+
+  const matches = candidates.filter(
+    item => getEpisodeNumber(item.label) === wanted
   );
 
-  if (matches.length === 1) {
-    return matches[0].url;
-  }
+  if (matches.length === 1) return matches[0].url;
 
-  const wantedSeason = Number(season);
+  if (matches.length > 1) {
+    const wantedSeason = Number(season);
 
-  if (
-    matches.length > 1 &&
-    Number.isFinite(wantedSeason)
-  ) {
-    const seasonMatches = matches.filter(item => {
-      const text = normalizeTitle(item.label);
-
-      return (
-        text.includes("season " + wantedSeason) ||
-        text.includes("الموسم " + wantedSeason) ||
-        text.includes("موسم " + wantedSeason)
-      );
-    });
+    const seasonMatches = matches.filter(item =>
+      new RegExp(
+        "(?:season|الموسم|موسم)\\s*" + wantedSeason,
+        "i"
+      ).test(normalizeTitle(item.label))
+    );
 
     if (seasonMatches.length === 1) {
       return seasonMatches[0].url;
     }
+
+    throw new Error("Multiple links match episode " + wanted);
   }
 
-  if (matches.length > 1) {
-    throw new Error(
-      "Multiple links match episode " +
-      wantedEpisode
-    );
+  if (candidates.length === 1) return candidates[0].url;
+
+  if (!candidates.length) {
+    console.log("[Z3ter] No episode links detected; trying series page.");
+    return seriesUrl;
   }
 
-  if (candidates.length === 1) {
-    return candidates[0].url;
-  }
-
-  throw new Error(
-    "Requested episode " +
-    wantedEpisode +
-    " was not found"
-  );
+  throw new Error("Requested episode " + wanted + " was not found");
 }
 
 /* -------------------- Stream extraction -------------------- */
 
 async function extractStreams(pageUrl, domain) {
-  const result = await fetchText(pageUrl);
-  const nodes = parseHtml(result.text);
-
-  const sources = nodes.filter(
-    node => node.tag === "source"
-  );
-
+  const page = await fetchText(pageUrl);
+  const nodes = parseHtml(page.text);
   const streams = [];
 
-  console.log(
-    "[Z3ter] Source elements found:",
-    sources.length
-  );
+  const sources = nodes.filter(node => node.tag === "source");
+
+  console.log("[Z3ter] Source elements found:", sources.length);
 
   for (const source of sources) {
     const parent = source.parent;
 
-    // Match the original CloudStream selector:
-    // video source
-    if (!parent || parent.tag !== "video") {
-      continue;
-    }
+    const isVideoSource =
+      (parent && parent.tag === "video") ||
+      (parent && parent.parent && parent.parent.tag === "video");
+
+    if (!isVideoSource) continue;
 
     const url = absoluteUrl(
       getAttribute(source.attrs, "src"),
-      result.url || pageUrl
+      page.url || pageUrl
     );
 
-    if (!url || !/^https?:\/\//i.test(url)) {
-      continue;
-    }
+    if (!url || !/^https?:\/\//i.test(url)) continue;
 
-    const type = getAttribute(
-      source.attrs,
-      "type"
-    ).toLowerCase();
-
-    const lowerUrl = url.toLowerCase();
-
-    let quality = "auto";
-
-    if (/1080/.test(lowerUrl)) {
-      quality = "1080p";
-    } else if (/720/.test(lowerUrl)) {
-      quality = "720p";
-    } else if (/480/.test(lowerUrl)) {
-      quality = "480p";
-    }
+    const type = getAttribute(source.attrs, "type").toLowerCase();
+    const lower = url.toLowerCase();
 
     let format = "";
 
-    if (
-      /\.m3u8(?:$|[?#])/i.test(url) ||
-      type.includes("mpegurl")
-    ) {
+    if (/\.m3u8(?:$|[?#])/.test(lower) || type.includes("mpegurl")) {
       format = "HLS";
-    } else if (
-      /\.mpd(?:$|[?#])/i.test(url) ||
-      type.includes("dash")
-    ) {
+    } else if (/\.mpd(?:$|[?#])/.test(lower) || type.includes("dash")) {
       format = "DASH";
-    } else if (
-      /\.mp4(?:$|[?#])/i.test(url) ||
-      type.includes("mp4")
-    ) {
+    } else if (/\.mp4(?:$|[?#])/.test(lower) || type.includes("mp4")) {
       format = "MP4";
     }
+
+    const quality = /1080/.test(lower)
+      ? "1080p"
+      : /720/.test(lower)
+        ? "720p"
+        : /480/.test(lower)
+          ? "480p"
+          : "auto";
 
     streams.push({
       name: PROVIDER_NAME + " - AlooyTV",
       title:
-        "AlooyTV | " +
-        quality +
+        "AlooyTV | " + quality +
         (format ? " | " + format : ""),
       url,
       quality,
@@ -741,102 +720,89 @@ async function extractStreams(pageUrl, domain) {
     });
   }
 
-  const uniqueStreams = streams.filter(
+  const unique = streams.filter(
     (stream, index, all) =>
-      all.findIndex(
-        item => item.url === stream.url
-      ) === index
+      all.findIndex(item => item.url === stream.url) === index
   );
 
-  console.log(
-    "[Z3ter] Valid streams extracted:",
-    uniqueStreams.length
-  );
-
-  return uniqueStreams;
+  console.log("[Z3ter] Valid streams extracted:", unique.length);
+  return unique;
 }
 
 /* -------------------- Nuvio entry point -------------------- */
 
-async function getStreams(
-  tmdbId,
-  mediaType,
-  season,
-  episode
-) {
+async function getStreams(tmdbId, mediaType, season, episode) {
   let stage = "validation";
 
   try {
-    if (
-      !tmdbId ||
-      !["movie", "tv"].includes(mediaType)
-    ) {
-      console.log(
-        "[Z3ter] Invalid input:",
-        { tmdbId, mediaType, season, episode }
-      );
+    if (!tmdbId || !["movie", "tv"].includes(mediaType)) {
+      console.log("[Z3ter] Invalid input:", {
+        tmdbId,
+        mediaType,
+        season,
+        episode
+      });
 
       return [];
     }
 
     stage = "domain discovery";
-
     const domain = await getAlooyDomain();
 
-    console.log(
-      "[Z3ter] Active domain:",
-      domain
-    );
+    console.log("[Z3ter] Active domain:", domain);
 
-    stage = "TMDB title lookup";
+    stage = "TMDB API title lookup";
+    const tmdbTitles = await getTmdbTitles(tmdbId, mediaType);
+    const searchTitles = [...tmdbTitles];
 
-    const titles = await getTmdbTitles(
-      tmdbId,
-      mediaType
-    );
+    // أضف أسماء elCinema إن أمكن، دون تعطيل البحث الأساسي.
+    for (const title of tmdbTitles) {
+      const aliases = await getElcinemaAliases(title);
 
-    console.log(
-      "[Z3ter] Titles to search:",
-      titles
-    );
-
-    let match = null;
-    let matchedTitle = "";
-
-    stage = "AlooyTV search";
-
-    for (const title of titles) {
-      console.log(
-        "[Z3ter] Searching:",
-        title
-      );
-
-      const results = await searchAlooy(
-        title,
-        domain
-      );
-
-      console.log(
-        "[Z3ter] Search results for",
-        title + ":",
-        results.length
-      );
-
-      const candidate = chooseBestResult(
-        results,
-        title
-      );
-
-      if (candidate) {
-        match = candidate;
-        matchedTitle = title;
-        break;
+      for (const alias of aliases) {
+        if (
+          !searchTitles.some(
+            existing =>
+              normalizeTitle(existing) === normalizeTitle(alias)
+          )
+        ) {
+          searchTitles.push(alias);
+        }
       }
     }
 
+    console.log("[Z3ter] Titles to search:", searchTitles);
+
+    stage = "AlooyTV search";
+
+    const allResults = [];
+    const seenUrls = new Set();
+
+    for (const title of searchTitles) {
+      try {
+        const results = await searchAlooy(title, domain);
+
+        for (const result of results) {
+          if (!seenUrls.has(result.url)) {
+            seenUrls.add(result.url);
+            allResults.push(result);
+          }
+        }
+      } catch (error) {
+        console.log(
+          "[Z3ter] Search failed for",
+          title + ":",
+          error.message || String(error)
+        );
+      }
+    }
+
+    const match = chooseBestResult(allResults, searchTitles);
+
     if (!match) {
       console.log(
-        "[Z3ter] No matching title found on AlooyTV."
+        "[Z3ter] No matching AlooyTV title. Candidates:",
+        allResults.length
       );
 
       return [];
@@ -844,16 +810,10 @@ async function getStreams(
 
     console.log(
       "[Z3ter] Selected title:",
-      match.title
-    );
-
-    console.log(
-      "[Z3ter] Matched using:",
-      matchedTitle
-    );
-
-    console.log(
-      "[Z3ter] Content page:",
+      match.title,
+      "| score:",
+      match.score,
+      "| URL:",
       match.url
     );
 
@@ -863,10 +823,7 @@ async function getStreams(
       stage = "episode selection";
 
       if (episode == null) {
-        console.log(
-          "[Z3ter] TV request is missing the episode number."
-        );
-
+        console.log("[Z3ter] TV request has no episode number.");
         return [];
       }
 
@@ -876,23 +833,14 @@ async function getStreams(
         episode
       );
 
-      console.log(
-        "[Z3ter] Selected episode page:",
-        playbackPage
-      );
+      console.log("[Z3ter] Selected episode page:", playbackPage);
     }
 
     stage = "stream extraction";
 
-    const streams = await extractStreams(
-      playbackPage,
-      domain
-    );
+    const streams = await extractStreams(playbackPage, domain);
 
-    console.log(
-      "[Z3ter] Finished. Stream count:",
-      streams.length
-    );
+    console.log("[Z3ter] Finished. Stream count:", streams.length);
 
     return streams;
   } catch (error) {
@@ -900,9 +848,7 @@ async function getStreams(
       "[Z3ter] Failed at stage:",
       stage,
       "| Error:",
-      error && error.message
-        ? error.message
-        : String(error)
+      error && error.message ? error.message : String(error)
     );
 
     return [];
@@ -912,4 +858,3 @@ async function getStreams(
 module.exports = {
   getStreams
 };
-    
