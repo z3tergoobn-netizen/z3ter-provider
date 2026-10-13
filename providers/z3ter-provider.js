@@ -1,10 +1,8 @@
+
 "use strict";
 
 /**
- ©© This project is just a test made by AI
- * Z3ter Provider - AlooyTV
- * Nuvio: getStreams(tmdbId, mediaType, season, episode)
- * TMDB API + optional elCinema aliases + flexible AlooyTV search.
+ *  ©© This project is just a test made by AI
  */
 
 const PROVIDER_NAME = "Z3ter Provider";
@@ -20,6 +18,56 @@ const USER_AGENT =
   "Chrome/131.0.0.0 Safari/537.36";
 
 let cachedDomain = null;
+
+// Cache مؤقت داخل ذاكرة المزود.
+const requestCache = new Map();
+const CACHE_TTL_MS = 10 * 60 * 1000;
+
+async function withCache(key, ttlMs, loader) {
+  const now = Date.now();
+  const cached = requestCache.get(key);
+
+  if (cached && cached.expiresAt > now) {
+    return cached.promise;
+  }
+
+  const promise = Promise.resolve().then(loader);
+  requestCache.set(key, {
+    expiresAt: now + ttlMs,
+    promise
+  });
+
+  try {
+    return await promise;
+  } catch (error) {
+    if (requestCache.get(key)?.promise === promise) {
+      requestCache.delete(key);
+    }
+    throw error;
+  }
+}
+
+// تشغيل عدد محدود من المهام بالتوازي.
+async function mapLimit(items, limit, mapper) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+
+  const workers = Array.from(
+    { length: Math.min(limit, items.length) },
+    async () => {
+      while (true) {
+        const index = nextIndex++;
+
+        if (index >= items.length) return;
+
+        results[index] = await mapper(items[index], index);
+      }
+    }
+  );
+
+  await Promise.all(workers);
+  return results;
+}
 
 /* -------------------- Text utilities -------------------- */
 
@@ -53,7 +101,10 @@ function getAttribute(tag, name) {
   const match = String(tag || "").match(
     new RegExp(
       "\\b" + escaped +
-      "\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)'|([^\\s>]+))",
+      "\\s*=\\s*(?:" +
+      '"([^"]*)"' +
+      "|'([^']*)'" +
+      "|([^\\s>]+))",
       "i"
     )
   );
@@ -259,21 +310,23 @@ async function tmdbJson(path, language) {
     "?api_key=" + encodeURIComponent(TMDB_API_KEY) +
     "&language=" + encodeURIComponent(language);
 
-  const response = await fetch(url, {
-    headers: {
-      "Accept": "application/json",
-      "User-Agent": USER_AGENT
-    },
-    redirect: "follow"
+  return withCache("tmdb:" + url, 30 * 60 * 1000, async () => {
+    const response = await fetch(url, {
+      headers: {
+        "Accept": "application/json",
+        "User-Agent": USER_AGENT
+      },
+      redirect: "follow"
+    });
+
+    if (!response.ok) {
+      throw new Error(
+        "TMDB API HTTP " + response.status + " for " + path
+      );
+    }
+
+    return response.json();
   });
-
-  if (!response.ok) {
-    throw new Error(
-      "TMDB API HTTP " + response.status + " for " + path
-    );
-  }
-
-  return response.json();
 }
 
 async function getTmdbTitles(tmdbId, mediaType) {
@@ -491,28 +544,33 @@ function chooseBestResult(results, targetTitles) {
 }
 
 async function searchAlooy(title, domain) {
-  const page = await fetchText(
-    domain + "/search?q=" + encodeURIComponent(title)
-  );
+  const key =
+    "alooy-search:" + domain + ":" + normalizeTitle(title);
 
-  const results = parseAlooyResults(
-    page.text,
-    page.url || domain
-  );
+  return withCache(key, 5 * 60 * 1000, async () => {
+    const page = await fetchText(
+      domain + "/search?q=" + encodeURIComponent(title)
+    );
 
-  console.log(
-    "[Z3ter] Alooy results for",
-    title + ":",
-    results.length
-  );
+    const results = parseAlooyResults(
+      page.text,
+      page.url || domain
+    );
 
-  return results;
+    console.log(
+      "[Z3ter] Alooy results for",
+      title + ":",
+      results.length
+    );
+
+    return results;
+  });
 }
 
 /* -------------------- elCinema optional aliases -------------------- */
 
 // مصدر مساعد فقط. فشل البحث هنا لا يوقف المزود.
-async function getElcinemaAliases(query) {
+async function fetchElcinemaAliases(query) {
   try {
     const page = await fetchText(
       ELCINEMA_SEARCH + "?q=" + encodeURIComponent(query)
@@ -576,6 +634,14 @@ async function getElcinemaAliases(query) {
   }
 }
 
+async function getElcinemaAliases(query) {
+  return withCache(
+    "elcinema:" + normalizeTitle(query),
+    30 * 60 * 1000,
+    () => fetchElcinemaAliases(query)
+  );
+}
+
 /* -------------------- Episode selection -------------------- */
 
 function getEpisodeNumber(label) {
@@ -595,7 +661,12 @@ function getEpisodeNumber(label) {
 }
 
 async function getEpisodeUrl(seriesUrl, season, episode) {
-  const page = await fetchText(seriesUrl);
+  const page = await withCache(
+    "episode-page:" + seriesUrl,
+    CACHE_TTL_MS,
+    () => fetchText(seriesUrl)
+  );
+
   const nodes = parseHtml(page.text);
 
   const episodeLinks = nodes.filter(
@@ -755,10 +826,14 @@ async function getStreams(tmdbId, mediaType, season, episode) {
     const tmdbTitles = await getTmdbTitles(tmdbId, mediaType);
     const searchTitles = [...tmdbTitles];
 
-    // أضف أسماء elCinema إن أمكن، دون تعطيل البحث الأساسي.
-    for (const title of tmdbTitles) {
-      const aliases = await getElcinemaAliases(title);
+    // جلب أسماء elCinema بالتوازي المحدود.
+    const aliasGroups = await mapLimit(
+      tmdbTitles,
+      3,
+      title => getElcinemaAliases(title)
+    );
 
+    for (const aliases of aliasGroups) {
       for (const alias of aliases) {
         if (
           !searchTitles.some(
@@ -778,22 +853,31 @@ async function getStreams(tmdbId, mediaType, season, episode) {
     const allResults = [];
     const seenUrls = new Set();
 
-    for (const title of searchTitles) {
-      try {
-        const results = await searchAlooy(title, domain);
+    // البحث عن العناوين بالتوازي بدلًا من انتظار كل عنوان منفردًا.
+    const resultGroups = await mapLimit(
+      searchTitles,
+      4,
+      async title => {
+        try {
+          return await searchAlooy(title, domain);
+        } catch (error) {
+          console.log(
+            "[Z3ter] Search failed for",
+            title + ":",
+            error.message || String(error)
+          );
 
-        for (const result of results) {
-          if (!seenUrls.has(result.url)) {
-            seenUrls.add(result.url);
-            allResults.push(result);
-          }
+          return [];
         }
-      } catch (error) {
-        console.log(
-          "[Z3ter] Search failed for",
-          title + ":",
-          error.message || String(error)
-        );
+      }
+    );
+
+    for (const results of resultGroups) {
+      for (const result of results) {
+        if (!seenUrls.has(result.url)) {
+          seenUrls.add(result.url);
+          allResults.push(result);
+        }
       }
     }
 
