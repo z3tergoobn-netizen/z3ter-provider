@@ -1,547 +1,328 @@
-// ©© made by AI - Hardened version to fix 403
 "use strict";
 
-const PROVIDER_NAME = "Oscar TV";
 const OSCAR_HOME = "https://ostv-11-11.xyz";
 const HEADER_HELPER = "https://flech.tn/scrapefinal/dramabox/step1_prepare_oscar.php";
 const TMDB_API_KEY = "09c002491851747716f94bd211a6681b";
 
-// استخدام User-Agent كامل وموحد لجميع الطلبات
-const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36";
-const PLAY_UA = "TDMuaHLS99"; // يُستخدم فقط لطلب الفيديو النهائي إذا لزم الأمر
+const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36";
+const PLAY_UA = "TDMuaHLS99";
 
-const cache = new Map();
-const CACHE_TTL = 3 * 60 * 1000; // 3 دقائق
-const HEADER_CACHE_TTL = 5 * 60 * 1000; // 5 دقائق لتخزين رؤوس X-Iron
+/* ==================== Cookie Jar (محاكاة OkHttpClient) ==================== */
+const cookieJar = new Map();
 
-function log(...args) {
-    console.log("[Oscar TV]", ...args);
-}
-
-function clean(value) {
-    return String(value ?? "").trim();
-}
-
-function absoluteUrl(value, base = OSCAR_HOME) {
-    const raw = clean(value);
-    if (!raw || /^(data:|blob:|javascript:)/i.test(raw)) return "";
-    try {
-        return new URL(raw, base).href;
-    } catch (_) {
-        return "";
-    }
-}
-
-function normalizeTitle(value) {
-    return clean(value)
-        .toLowerCase()
-        .replace(/[\u064B-\u065F\u0670ـ]/g, "")
-        .replace(/[أإآٱ]/g, "ا")
-        .replace(/ى/g, "ي")
-        .replace(/[^\p{L}\p{N}]+/gu, " ")
-        .trim()
-        .replace(/\s+/g, " ");
-}
-
-function titleScore(candidate, target) {
-    const a = normalizeTitle(candidate);
-    const b = normalizeTitle(target);
-    if (!a || !b) return 0;
-    if (a === b) return 100;
-    if (a.startsWith(b) || b.startsWith(a)) return 82;
-    const targetWords = b.split(" ");
-    const candidateWords = new Set(a.split(" "));
-    const common = targetWords.filter(word => candidateWords.has(word));
-    return targetWords.length ? (common.length / targetWords.length) * 70 : 0;
-}
-
-async function fetchJson(url, options = {}) {
-    const response = await fetch(url, options);
-    if (!response.ok) {
-        throw new Error("HTTP " + response.status + ": " + url);
-    }
-    return response.json();
-}
-
-async function cached(key, loader, ttl = CACHE_TTL) {
-    const existing = cache.get(key);
-    if (existing && existing.expires > Date.now()) {
-        return existing.promise;
-    }
-    const promise = Promise.resolve().then(loader);
-    cache.set(key, { expires: Date.now() + ttl, promise });
-    try {
-        return await promise;
-    } catch (error) {
-        if (cache.get(key)?.promise === promise) {
-            cache.delete(key);
+function parseSetCookie(header, host) {
+    if (!header) return;
+    const jar = cookieJar.get(host) || {};
+    header.split(/,(?=[^ ;]+=)/).forEach(part => {
+        const [pair] = part.split(";");
+        const idx = pair.indexOf("=");
+        if (idx > 0) {
+            const k = pair.slice(0, idx).trim();
+            const v = pair.slice(idx + 1).trim();
+            if (k && v) jar[k] = v;
         }
-        throw error;
-    }
+    });
+    cookieJar.set(host, jar);
 }
 
-/* -------------------- Header Management (Fix 403) -------------------- */
+function getCookieHeader(host) {
+    const jar = cookieJar.get(host);
+    if (!jar) return "";
+    return Object.entries(jar).map(([k, v]) => k + "=" + v).join("; ");
+}
 
-// تخزين مؤقت لرؤوس X-Iron لكل رابط
+/* ==================== Throttle ==================== */
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+let lastReq = 0;
+async function throttle(gap = 300) {
+    const wait = lastReq + gap - Date.now();
+    if (wait > 0) await sleep(wait);
+    lastReq = Date.now();
+}
+
+/* ==================== Header Cache (20s فقط) ==================== */
 const headerCache = new Map();
+const HEADER_TTL = 20 * 1000;
 
-async function getFreshHeaders(url) {
-    const cacheKey = "headers:" + url;
-    const cachedEntry = headerCache.get(cacheKey);
-    if (cachedEntry && cachedEntry.expires > Date.now()) {
-        return cachedEntry.headers;
+async function getFreshHeaders(targetUrl) {
+    const cached = headerCache.get(targetUrl);
+    if (cached && cached.expires > Date.now()) return cached.headers;
+
+    const res = await fetch(HEADER_HELPER, {
+        method: "POST",
+        headers: {
+            "User-Agent": UA,
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json, text/plain, */*",
+            "Origin": "https://flech.tn",
+            "Referer": "https://flech.tn/",
+        },
+        body: "url=" + encodeURIComponent(targetUrl),
+    });
+    if (!res.ok) throw new Error("Header helper HTTP " + res.status);
+
+    const json = await res.json();
+    const src = json?.headers;
+    if (!src || typeof src !== "object") throw new Error("No headers from helper");
+
+    const headers = {};
+    for (const [k, v] of Object.entries(src)) {
+        if (v == null) continue;
+        if (/^(host|connection|content-length)$/i.test(k)) continue;
+        headers[k] = String(v);
     }
-    try {
-        const prepared = await fetchJson(HEADER_HELPER, {
-            method: "POST",
-            headers: {
-                "User-Agent": USER_AGENT,
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Accept": "application/json, text/plain, */*"
-            },
-            body: "url=" + encodeURIComponent(url)
-        });
-        const sourceHeaders = prepared?.headers;
-        if (!sourceHeaders || typeof sourceHeaders !== "object") {
-            throw new Error("Header helper returned no headers");
-        }
-        const headers = {};
-        for (const [key, value] of Object.entries(sourceHeaders)) {
-            if (value == null) continue;
-            if (/^(host|connection)$/i.test(key)) continue;
-            headers[key] = String(value);
-        }
-        // إضافة/ضمان وجود User-Agent و Accept
-        headers["User-Agent"] = headers["User-Agent"] || USER_AGENT;
-        headers["Accept"] = headers["Accept"] || "application/json, text/plain, */*";
-        
-        // تخزين الرؤوس لمدة 5 دقائق
-        headerCache.set(cacheKey, {
-            headers,
-            expires: Date.now() + HEADER_CACHE_TTL
-        });
-        return headers;
-    } catch (error) {
-        log("Failed to fetch fresh headers:", error.message);
-        throw error;
-    }
+    headers["User-Agent"] = headers["User-Agent"] || UA;
+    headers["Accept"] = headers["Accept"] || "application/json, text/plain, */*";
+
+    headerCache.set(targetUrl, { headers, expires: Date.now() + HEADER_TTL });
+    return headers;
 }
 
-/* -------------------- Oscar API Call with 403 Retry -------------------- */
-
+/* ==================== Oscar API Call (3 Retries + Cookies) ==================== */
 async function oscarCall(path) {
     const url = OSCAR_HOME + "/" + String(path).replace(/^\/+/, "");
-    return cached("api:" + url, async () => {
-        const performRequest = async (retry = false) => {
-            try {
-                const headers = await getFreshHeaders(url);
-                const response = await fetch(url, {
-                    method: "GET",
-                    headers,
-                    redirect: "follow"
-                });
-                if (!response.ok) {
-                    if (response.status === 403 && !retry) {
-                        log("403 detected, refreshing headers and retrying...");
-                        // حذف الرؤوس المخزنة وإعادة المحاولة
-                        headerCache.delete("headers:" + url);
-                        return performRequest(true);
-                    }
-                    throw new Error("HTTP " + response.status + ": " + url);
-                }
-                return response.json();
-            } catch (error) {
-                if (retry) {
-                    log("Request failed after retry:", error.message);
-                    throw error;
-                }
-                // إعادة المحاولة مرة واحدة عند أي خطأ
-                log("Request failed, retrying once:", error.message);
-                return performRequest(true);
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+            await throttle(attempt === 0 ? 200 : 900);
+
+            // في المحاولات اللاحقة: نجبر جلب رؤوس جديدة
+            if (attempt > 0) headerCache.delete(url);
+
+            const headers = await getFreshHeaders(url);
+            headers["Referer"] = OSCAR_HOME + "/";
+            headers["Origin"] = OSCAR_HOME;
+
+            const ck = getCookieHeader("ostv-11-11.xyz");
+            if (ck) headers["Cookie"] = ck;
+
+            const res = await fetch(url, { headers, redirect: "follow" });
+            parseSetCookie(res.headers.get("set-cookie"), "ostv-11-11.xyz");
+
+            if (res.status === 403) {
+                console.log(`[Oscar] 403 attempt ${attempt + 1}, refreshing...`);
+                continue;
             }
-        };
-        return performRequest(false);
-    });
-}
-
-/* -------------------- Helper Functions -------------------- */
-
-function getDataObject(response) {
-    const data = response?.data;
-    return data && !Array.isArray(data) && typeof data === "object" ? data : null;
-}
-
-function getDataArray(response) {
-    return Array.isArray(response?.data) ? response.data : [];
-}
-
-function getString(object, ...keys) {
-    for (const key of keys) {
-        const value = clean(object?.[key]);
-        if (value && value !== "null" && value !== "undefined") {
-            return value;
+            if (!res.ok) throw new Error("HTTP " + res.status);
+            return res.json();
+        } catch (e) {
+            console.log(`[Oscar] attempt ${attempt + 1} failed: ${e.message}`);
+            if (attempt === 2) throw e;
         }
+    }
+    throw new Error("All retries failed: " + url);
+}
+
+/* ==================== Helper Functions ==================== */
+function clean(v) { return String(v ?? "").trim(); }
+function absoluteUrl(v, base = OSCAR_HOME) {
+    const raw = clean(v);
+    if (!raw || /^(data:|blob:|javascript:)/i.test(raw)) return "";
+    try { return new URL(raw, base).href; } catch { return ""; }
+}
+function getString(o, ...keys) {
+    for (const k of keys) {
+        const v = clean(o?.[k]);
+        if (v && v !== "null" && v !== "undefined") return v;
     }
     return "";
 }
-
-function getNumber(object, ...keys) {
-    for (const key of keys) {
-        const number = Number(object?.[key]);
-        if (Number.isFinite(number) && number > 0) {
-            return number;
-        }
+function getNumber(o, ...keys) {
+    for (const k of keys) {
+        const n = Number(o?.[k]);
+        if (Number.isFinite(n) && n > 0) return n;
     }
     return null;
 }
+function getDataObject(r) {
+    const d = r?.data;
+    return d && !Array.isArray(d) && typeof d === "object" ? d : null;
+}
+function getDataArray(r) { return Array.isArray(r?.data) ? r.data : []; }
 
-/* -------------------- TMDB Titles -------------------- */
-
+/* ==================== TMDB ==================== */
 async function getTitles(tmdbId, mediaType) {
     const type = mediaType === "tv" ? "tv" : "movie";
-    return cached(
-        "tmdb:" + type + ":" + tmdbId,
-        async () => {
-            const titles = [];
-            const addTitle = value => {
-                const title = clean(value);
-                if (title && !titles.some(item => normalizeTitle(item) === normalizeTitle(title))) {
-                    titles.push(title);
-                }
-            };
-            for (const language of ["ar-SA", "en-US"]) {
-                try {
-                    const url = "https://api.themoviedb.org/3/" + type + "/" +
-                        encodeURIComponent(tmdbId) +
-                        "?api_key=" + encodeURIComponent(TMDB_API_KEY) +
-                        "&language=" + encodeURIComponent(language);
-                    const data = await fetchJson(url, {
-                        headers: { "User-Agent": USER_AGENT, "Accept": "application/json" }
-                    });
-                    addTitle(type === "tv" ? data.name : data.title);
-                    addTitle(type === "tv" ? data.original_name : data.original_title);
-                } catch (error) {
-                    log("TMDB lookup failed:", error.message || String(error));
-                }
-            }
-            if (!titles.length) {
-                throw new Error("No titles returned by TMDB");
-            }
-            return titles;
-        },
-        30 * 60 * 1000
-    );
+    const titles = [];
+    const add = v => {
+        const t = clean(v);
+        if (t && !titles.some(x => x.toLowerCase() === t.toLowerCase())) titles.push(t);
+    };
+    for (const lang of ["ar-SA", "en-US"]) {
+        try {
+            const url = `https://api.themoviedb.org/3/${type}/${encodeURIComponent(tmdbId)}?api_key=${TMDB_API_KEY}&language=${lang}`;
+            const data = await (await fetch(url, { headers: { "User-Agent": UA } })).json();
+            add(type === "tv" ? data.name : data.title);
+            add(type === "tv" ? data.original_name : data.original_title);
+        } catch (e) { console.log("[Oscar] TMDB fail:", e.message); }
+    }
+    return titles;
 }
 
-/* -------------------- Oscar Search -------------------- */
+/* ==================== Search ==================== */
+function titleScore(a, b) {
+    const na = a.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+    const nb = b.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+    if (!na || !nb) return 0;
+    if (na === nb) return 100;
+    if (na.startsWith(nb) || nb.startsWith(na)) return 82;
+    const wa = new Set(na.split(" "));
+    const common = nb.split(" ").filter(w => wa.has(w)).length;
+    return (common / nb.split(" ").length) * 70;
+}
 
 async function searchOscar(kind, query) {
     const prefix = kind === "movie" ? "api/movies" : kind === "anime" ? "api/anime" : "api/series";
-    const response = await oscarCall(
-        prefix + "/?page=1&limit=20&search=" + encodeURIComponent(query)
-    );
-    return getDataArray(response)
-        .map(item => {
-            const id = getNumber(item, "id", "item_id");
-            const title = getString(item, "title_ar", "title_en", "name", "series_title");
-            if (!id || !title) return null;
-            return {
-                id,
-                kind,
-                title,
-                poster: absoluteUrl(getString(item, "poster", "image"))
-            };
-        })
-        .filter(Boolean);
-}
-
-async function mapLimit(items, limit, callback) {
-    const results = new Array(items.length);
-    let next = 0;
-    await Promise.all(
-        Array.from({ length: Math.min(limit, items.length) }, async () => {
-            while (true) {
-                const index = next++;
-                if (index >= items.length) return;
-                try {
-                    results[index] = await callback(items[index]);
-                } catch (error) {
-                    log("Search task failed:", error.message || String(error));
-                    results[index] = [];
-                }
-            }
-        })
-    );
-    return results;
+    const res = await oscarCall(`${prefix}/?page=1&limit=20&search=${encodeURIComponent(query)}`);
+    return getDataArray(res).map(item => {
+        const id = getNumber(item, "id", "item_id");
+        const title = getString(item, "title_ar", "title_en", "name", "series_title");
+        if (!id || !title) return null;
+        return { id, kind, title };
+    }).filter(Boolean);
 }
 
 async function findBestMatch(titles, mediaType) {
     const kinds = mediaType === "movie" ? ["movie"] : ["series", "anime"];
     const tasks = [];
-    for (const title of titles.slice(0, 6)) {
-        for (const kind of kinds) {
-            tasks.push({ title, kind });
+    for (const t of titles.slice(0, 4)) for (const k of kinds) tasks.push({ t, k });
+
+    const seen = new Set(), all = [];
+    for (let i = 0; i < tasks.length; i += 3) {
+        const batch = tasks.slice(i, i + 3);
+        const groups = await Promise.all(batch.map(async ({ t, k }) => {
+            try { return await searchOscar(k, t); } catch { return []; }
+        }));
+        for (const g of groups) for (const r of g) {
+            const key = r.kind + ":" + r.id;
+            if (!seen.has(key)) { seen.add(key); all.push(r); }
         }
     }
-    const groups = await mapLimit(tasks, 3, task => searchOscar(task.kind, task.title));
-    const results = [];
-    const seen = new Set();
-    for (const group of groups) {
-        for (const result of group || []) {
-            const key = result.kind + ":" + result.id;
-            if (!seen.has(key)) {
-                seen.add(key);
-                results.push(result);
-            }
-        }
+
+    let best = null, bestScore = 0;
+    for (const r of all) for (const t of titles) {
+        const s = titleScore(r.title, t);
+        if (s > bestScore) { best = r; bestScore = s; }
     }
-    let best = null;
-    let bestScore = 0;
-    for (const result of results) {
-        for (const title of titles) {
-            const score = titleScore(result.title, title);
-            if (score > bestScore) {
-                best = result;
-                bestScore = score;
-            }
-        }
-    }
-    log("Candidates:", results.length, "best score:", bestScore);
     return bestScore >= 45 ? { ...best, score: bestScore } : null;
 }
 
-/* -------------------- Stream Formatting -------------------- */
-
-function getFormat(url) {
-    const value = String(url || "").toLowerCase();
-    if (/\.m3u8(?:$|[?#])/.test(value)) return "HLS";
-    if (/\.mpd(?:$|[?#])/.test(value)) return "DASH";
-    if (/\.mp4(?:$|[?#])/.test(value)) return "MP4";
-    if (/\.mkv(?:$|[?#])/.test(value)) return "MKV";
-    return "Direct";
-}
-
-function getQualityInfo(value, url) {
-    const source = clean(value);
-    const combined = source + " " + String(url || "");
-    const match = combined.match(/(?:^|\D)(2160|1440|1080|720|576|540|480|360)p?(?:\D|$)/i);
-    if (match) {
-        const resolution = Number(match[1]);
-        let label;
-        if (resolution >= 2160) label = "4K UHD";
-        else if (resolution >= 1440) label = "QHD";
-        else if (resolution >= 1080) label = "FHD";
-        else if (resolution >= 720) label = "HD";
-        else label = "SD";
-        return { resolution, quality: resolution + "p", label };
-    }
-    if (/\b(?:4k|uhd|ultra[\s-]*hd)\b/i.test(combined)) {
-        return { resolution: 2160, quality: "2160p", label: "4K UHD" };
-    }
-    if (/\b(?:fhd|full[\s-]*hd)\b/i.test(combined)) {
-        return { resolution: 1080, quality: "1080p", label: "FHD" };
-    }
-    if (/\bqhd\b/i.test(combined)) {
-        return { resolution: 1440, quality: "1440p", label: "QHD" };
-    }
-    if (/\bhd\b/i.test(combined)) {
-        return { resolution: 0, quality: "HD", label: "HD" };
-    }
-    if (/\b(?:sd|low|mobile)\b/i.test(combined)) {
-        return { resolution: 480, quality: "480p", label: "SD" };
-    }
-    return { resolution: 0, quality: "Auto", label: "Auto" };
-}
-
-function qualityRank(stream) {
-    return Number(stream?.resolution) || -1;
-}
-
-function getQualityEmoji(resolution) {
-    if (resolution >= 2160) return "🏆";
-    if (resolution >= 1440) return "💎";
-    if (resolution >= 1080) return "⚡";
-    if (resolution >= 720) return "🔥";
-    if (resolution >= 576) return "⭐";
-    if (resolution >= 540) return "✨";
-    if (resolution >= 480) return "💫";
-    if (resolution > 0) return "🌟";
-    return "❔";
-}
-
-/* -------------------- Stream Extraction -------------------- */
-
+/* ==================== Stream Extraction ==================== */
 async function resolveSpecialHost(url) {
     if (!url.includes("newcdn.seriesmp4.com")) return url;
     try {
-        const response = await fetch(url, {
-            headers: { "User-Agent": PLAY_UA },
-            redirect: "follow"
-        });
-        if (!response.ok) return "";
-        const html = await response.text();
-        const match = html.match(/src=["'](https:\/\/downloader\.disk\.yandex\.ru[^"']+)["']/i);
-        return match ? match[1].replace(/&/g, "&") : "";
-    } catch (error) {
-        log("Special host resolution failed:", error.message || String(error));
-        return "";
-    }
+        const res = await fetch(url, { headers: { "User-Agent": PLAY_UA }, redirect: "follow" });
+        if (!res.ok) return "";
+        const html = await res.text();
+        const m = html.match(/src=["'](https:\/\/downloader\.disk\.yandex\.ru[^"']+)["']/i);
+        return m ? m[1].replace(/&/g, "&") : "";
+    } catch { return ""; }
+}
+
+function getFormat(u) {
+    const v = u.toLowerCase();
+    if (/\.m3u8/.test(v)) return "HLS";
+    if (/\.mpd/.test(v)) return "DASH";
+    if (/\.mp4/.test(v)) return "MP4";
+    return "Direct";
+}
+
+function getQualityInfo(q, u) {
+    const s = (q + " " + u).toLowerCase();
+    const m = s.match(/(2160|1440|1080|720|576|540|480|360)p/);
+    const r = m ? +m[1] : 0;
+    return { r, label: r ? r + "p" : "Auto" };
+}
+
+function qEmoji(r) {
+    if (r >= 2160) return "🏆"; if (r >= 1440) return "💎";
+    if (r >= 1080) return "⚡"; if (r >= 720) return "🔥";
+    if (r >= 480) return "💫"; return "❔";
 }
 
 async function extractStreams(detail) {
-    const candidates = [];
-    for (const item of detail?.watch_links || []) {
-        candidates.push({
-            url: getString(item, "url"),
-            server: getString(item, "server_name") || "Oscar TV",
-            quality: getString(item, "quality")
+    const cands = [];
+    for (const i of detail?.watch_links || [])
+        cands.push({ url: getString(i, "url"), server: getString(i, "server_name") || "Oscar", quality: getString(i, "quality") });
+    for (const i of detail?.download_links || [])
+        cands.push({ url: getString(i, "url"), server: getString(i, "server_name") || "DL", quality: getString(i, "quality") });
+
+    const out = [], seen = new Set();
+    for (const c of cands) {
+        let u = absoluteUrl(c.url);
+        if (!/^https?:\/\//i.test(u)) continue;
+        u = await resolveSpecialHost(u);
+        if (!u || seen.has(u)) continue;
+        seen.add(u);
+        const fmt = getFormat(u);
+        const qi = getQualityInfo(c.quality, u);
+        out.push({
+            name: "\u200E" + qEmoji(qi.r) + " " + qi.label,
+            title: " " + qi.label + " · " + fmt + " · Oscar TV\nmade by ✌⁵¹⁵",
+            description: " " + qi.label + " · " + fmt + " · Oscar TV\nmade by ✌⁵¹⁵",
+            url: u,
+            quality: qi.label,
+            resolution: qi.r,
+            headers: { "User-Agent": UA, "Referer": OSCAR_HOME + "/" },
         });
     }
-    for (const item of detail?.download_links || []) {
-        candidates.push({
-            url: getString(item, "url"),
-            server: getString(item, "server_name") || "Download",
-            quality: getString(item, "quality")
-        });
-    }
-    const streams = [];
-    const seen = new Set();
-    for (const item of candidates) {
-        let url = absoluteUrl(item.url);
-        if (!/^https?:\/\//i.test(url)) continue;
-        url = await resolveSpecialHost(url);
-        if (!url || !/^https?:\/\//i.test(url) || seen.has(url)) {
-            continue;
-        }
-        seen.add(url);
-        const format = getFormat(url);
-        const info = getQualityInfo(item.quality, url);
-        const emoji = getQualityEmoji(info.resolution);
-        streams.push({
-            name: "\u200E" + emoji + " " + info.label,
-            title: "️ " + info.quality + " · " + format + " · Oscar TV\n" +
-                "made by ✌⁵¹⁵",
-            description: "️ " + info.quality + " · " + format + " · Oscar TV\n" +
-                "made by ✌⁵¹⁵",
-            size: "️ " + info.quality + " · " + format + " · Oscar TV\n" +
-                "made by ✌⁵¹⁵",
-            url,
-            quality: info.quality,
-            resolution: info.resolution,
-            headers: {
-                "User-Agent": USER_AGENT, // استخدام UA الموحد
-                "Referer": OSCAR_HOME + "/"
-            }
-        });
-    }
-    streams.sort((a, b) => qualityRank(b) - qualityRank(a));
-    return streams;
+    out.sort((a, b) => (b.resolution || 0) - (a.resolution || 0));
+    return out;
 }
 
+/* ==================== Loaders ==================== */
 async function getMovieStreams(match) {
-    const response = await oscarCall(
-        "api/movies/show.php?id=" + encodeURIComponent(match.id)
-    );
-    const detail = getDataObject(response);
-    return detail ? extractStreams(detail) : [];
+    const res = await oscarCall("api/movies/show.php?id=" + encodeURIComponent(match.id));
+    const d = getDataObject(res);
+    return d ? extractStreams(d) : [];
 }
 
 async function getEpisodeStreams(match, season, episode) {
     const isAnime = match.kind === "anime";
     const base = isAnime ? "api/anime" : "api/series";
-    const showResponse = await oscarCall(
-        base + "/show.php?id=" + encodeURIComponent(match.id)
-    );
-    const show = getDataObject(showResponse);
+    const show = getDataObject(await oscarCall(`${base}/show.php?id=${match.id}`));
     if (!show) return [];
 
     const seasons = Array.isArray(show.seasons) ? show.seasons : [];
-    const wantedSeason = Number(season || 1);
-    const wantedEpisode = Number(episode);
-    let selectedSeasons = seasons.filter(
-        item => Number(item.season_number || 1) === wantedSeason
-    );
-    if (!selectedSeasons.length && seasons.length) {
-        selectedSeasons = seasons.filter(
-            item => Number(item.season_number || 1) === 1
-        );
-    }
-    if (!selectedSeasons.length) {
-        selectedSeasons = seasons.slice(0, 1);
+    const ws = Number(season || 1), we = Number(episode);
+    let sel = seasons.filter(s => Number(s.season_number || 1) === ws);
+    if (!sel.length) sel = seasons.filter(s => Number(s.season_number || 1) === 1);
+    if (!sel.length) sel = seasons.slice(0, 1);
+
+    const eps = [];
+    for (const s of sel) {
+        const sid = getNumber(s, "season_id", "id");
+        if (!sid) continue;
+        const path = isAnime ? `api/anime/episodes/?season_id=${sid}` : `api/episodes/?season_id=${sid}`;
+        const arr = getDataArray(await oscarCall(path));
+        arr.forEach((e, i) => {
+            const id = getNumber(e, "id");
+            if (id) eps.push({ id, number: getNumber(e, "episode_number") || i + 1, season: Number(s.season_number || 1) });
+        });
     }
 
-    const groups = await mapLimit(selectedSeasons, 3, async item => {
-        const seasonId = getNumber(item, "season_id", "id");
-        if (!seasonId) return [];
-        const episodePath = isAnime ? "api/anime/episodes/" : "api/episodes/";
-        const response = await oscarCall(
-            episodePath + "?season_id=" + encodeURIComponent(seasonId)
-        );
-        return getDataArray(response)
-            .map((ep, index) => ({
-                id: getNumber(ep, "id"),
-                number: getNumber(ep, "episode_number") || index + 1,
-                season: getNumber(item, "season_number") || 1
-            }))
-            .filter(ep => ep.id);
-    });
-
-    const episodes = groups.flat();
-    let selected = episodes.find(
-        ep => ep.season === wantedSeason && ep.number === wantedEpisode
-    );
-    if (!selected) {
-        selected = episodes.find(ep => ep.number === wantedEpisode);
-    }
-    if (!selected && episodes.length === 1) {
-        selected = episodes[0];
-    }
-    if (!selected) {
-        log("Episode not found:", wantedSeason, wantedEpisode);
-        return [];
-    }
+    let target = eps.find(e => e.season === ws && e.number === we) || eps.find(e => e.number === we) || (eps.length === 1 ? eps[0] : null);
+    if (!target) return [];
 
     const detailPath = isAnime ? "api/anime/episodes/show.php" : "api/episodes/show.php";
-    const response = await oscarCall(
-        detailPath + "?id=" + encodeURIComponent(selected.id)
-    );
-    const detail = getDataObject(response);
-    return detail ? extractStreams(detail) : [];
+    const d = getDataObject(await oscarCall(`${detailPath}?id=${target.id}`));
+    return d ? extractStreams(d) : [];
 }
 
-/* -------------------- Nuvio Entry Point -------------------- */
-
+/* ==================== Nuvio Entry ==================== */
 async function getStreams(tmdbId, mediaType, season, episode) {
-    let stage = "validation";
     try {
-        if (!tmdbId || !["movie", "tv"].includes(mediaType)) {
-            return [];
-        }
-        stage = "TMDB title lookup";
+        if (!tmdbId || !["movie", "tv"].includes(mediaType)) return [];
         const titles = await getTitles(tmdbId, mediaType);
-        stage = "Oscar search";
+        if (!titles.length) return [];
         const match = await findBestMatch(titles, mediaType);
-        if (!match) {
-            log("No confident title match:", titles);
-            return [];
-        }
-        log(
-            "Selected:", match.kind, match.title, "ID:", match.id, "score:", match.score
-        );
-        stage = "Stream extraction";
-        if (mediaType === "movie") {
-            return await getMovieStreams(match);
-        }
-        if (episode == null) {
-            log("TV request has no episode number");
-            return [];
-        }
+        if (!match) return [];
+        console.log(`[Oscar] Match: ${match.kind} #${match.id} "${match.title}" (${match.score})`);
+        if (mediaType === "movie") return await getMovieStreams(match);
+        if (episode == null) return [];
         return await getEpisodeStreams(match, season, episode);
-    } catch (error) {
-        console.error(
-            "[Oscar TV] Failed at " + stage + ":",
-            error?.message || String(error)
-        );
+    } catch (e) {
+        console.error("[Oscar] Fatal:", e.message);
         return [];
     }
 }
