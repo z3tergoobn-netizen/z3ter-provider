@@ -65,21 +65,40 @@ function titleScore(candidate, target) {
 }
 
 async function fetchJson(url, options = {}) {
-  const response = await fetch(url, options);
+    const response = await fetch(url, options);
+    const source = url.startsWith(HEADER_HELPER) ? "helper"
+                 : url.startsWith(OSCAR_HOME)   ? "api"
+                 : "other";
+    const contentType = response.headers.get("content-type") || "";
+    const text = await response.text();   // نقرأ النص أولاً بدلاً من response.json()
 
-  if (!response.ok) {
-    // Tag the error so logs say WHO refused us: the signing helper or Oscar itself.
-    const source = url.startsWith(HEADER_HELPER)
-      ? "helper"
-      : url.startsWith(OSCAR_HOME) ? "api" : "other";
+    if (!response.ok) {
+        const error = new Error(source + " HTTP " + response.status + ": " + url);
+        error.status = response.status;
+        error.source = source;
+        error.contentType = contentType;
+        if (/text\/html/i.test(contentType) || /^\s*</.test(text)) {
+            console.warn("[Oscar TV][diag] " + source + " HTML (status " +
+                response.status + ", ct=" + contentType + "): " +
+                text.slice(0, 200).replace(/\s+/g, " "));
+        }
+        throw error;
+    }
 
-    const error = new Error(source + " HTTP " + response.status + ": " + url);
-    error.status = response.status;
-    error.source = source;
-    throw error;
-  }
-
-  return response.json();
+    try {
+        return JSON.parse(text);
+    } catch (parseError) {
+        const error = new Error(source + " non-JSON (status " + response.status +
+            ", ct=" + contentType + ")");
+        error.status = response.status;
+        error.source = source;
+        error.contentType = contentType;
+        if (/text\/html/i.test(contentType) || /^\s*</.test(text)) {
+            console.warn("[Oscar TV][diag] " + source + " HTML body snippet: " +
+                text.slice(0, 200).replace(/\s+/g, " "));
+        }
+        throw error;
+    }
 }
 
 async function cached(key, loader, ttl = CACHE_TTL) {
