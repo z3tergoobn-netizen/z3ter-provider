@@ -33,6 +33,22 @@
       "contentLanguage": ["ar", "en"],
       "limited": false,
       "supportsExternalPlayer": true
+    },
+    {
+      "id": "cartoon",
+      "name": "🧸CaRtooN🧸",
+      "description": "Arabic cartoons, animated movies, series and episodes from Arabic-Toons.",
+      "version": "1.0.0",
+      "author": "z3tergoobn-netizen",
+      "supportedTypes": ["movie", "tv"],
+      "filename": "providers/cartoon.js",
+      "enabled": true,
+      "hasSettings": false,
+      "formats": ["mp4", "m3u8"],
+      "logo": "",
+      "contentLanguage": ["ar"],
+      "limited": false,
+      "supportsExternalPlayer": true
     }
   ]
 }
