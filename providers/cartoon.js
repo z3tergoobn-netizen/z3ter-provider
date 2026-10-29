@@ -1,9 +1,7 @@
 
 "use strict";
 
-
-// * 🧸CaRtooN🧸 for Nuvio
-
+// 🧸CaRtooN🧸 for Nuvio
 
 const PROVIDER_NAME = "🧸CaRtooN🧸";
 const SITE = "https://www.arabic-toons.com";
@@ -67,6 +65,9 @@ function stripHtml(value) {
     .replace(/&#(\d+);/g, (_, n) =>
       String.fromCharCode(Number(n))
     )
+    .replace(/&#x([0-9a-f]+);/gi, (_, n) =>
+      String.fromCharCode(parseInt(n, 16))
+    )
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -77,7 +78,14 @@ function decodeHtml(value) {
     .replace(/&quot;/gi, '"')
     .replace(/&#39;|&apos;/gi, "'")
     .replace(/&lt;/gi, "<")
-    .replace(/&gt;/gi, ">");
+    .replace(/&gt;/gi, ">")
+    .replace(/&nbsp;|&#160;/gi, " ")
+    .replace(/&#(\d+);/g, (_, n) =>
+      String.fromCharCode(Number(n))
+    )
+    .replace(/&#x([0-9a-f]+);/gi, (_, n) =>
+      String.fromCharCode(parseInt(n, 16))
+    );
 }
 
 function slugify(value) {
@@ -141,6 +149,7 @@ async function fetchResponse(url, options = {}) {
   const headers = {
     "User-Agent": USER_AGENT,
     "Accept": "*/*",
+    "Accept-Language": "ar,en;q=0.9",
     ...(options.headers || {})
   };
 
@@ -184,9 +193,10 @@ async function fetchJson(url, options = {}) {
 }
 
 /*
- * Do not pretend that a DoH lookup changes the resolver used by fetch().
- * A real proxy must be deployed separately and configured here before
- * it can be used safely.
+ * DNS note:
+ * DNS-over-HTTPS alone does not change the resolver used by fetch().
+ * If the Nuvio runtime cannot resolve the domain, a real external proxy
+ * or a runtime-level DNS fix is needed. No fake DNS workaround is used.
  */
 
 /* -------------------- TMDB titles -------------------- */
@@ -224,6 +234,7 @@ async function getTmdbTitles(tmdbId, mediaType) {
           const data = await fetchJson(url);
 
           addTitle(type === "tv" ? data.name : data.title);
+
           addTitle(
             type === "tv"
               ? data.original_name
@@ -244,12 +255,13 @@ async function getTmdbTitles(tmdbId, mediaType) {
   );
 }
 
-/* -------------------- Search -------------------- */
+/* -------------------- Search parsing -------------------- */
 
 function parseSearchItem(item, kind) {
   if (!item || typeof item !== "object") return null;
 
   const id = clean(item.id || item.anime_id || item.serie_id);
+
   const title = stripHtml(
     item.title ||
     item.name ||
@@ -266,12 +278,16 @@ function parseSearchItem(item, kind) {
   );
 
   const slug = slugify(item.subtitle || title);
+
   const suffix = kind === "movie"
     ? "movies-streaming.html"
     : "anime-streaming.html";
 
   const url = suppliedUrl ||
-    (SITE + "/" + slug + "-" + encodeURIComponent(id) + "-" + suffix);
+    (
+      SITE + "/" + slug + "-" +
+      encodeURIComponent(id) + "-" + suffix
+    );
 
   const poster = absoluteUrl(
     item.image || item.poster || item.thumbnail
@@ -313,6 +329,66 @@ function getSearchItems(data) {
   ].filter(Boolean);
 }
 
+/*
+ * HTML fallback:
+ * Used if the search endpoint returns HTML instead of JSON.
+ * Only accepts URLs matching the site's known series/movie URL patterns.
+ */
+function parseSearchHtml(html, pageUrl) {
+  const results = [];
+  const seen = new Set();
+
+  const anchorRegex = /<a\b([^>]*)>([\s\S]*?)<\/a>/gi;
+  let match;
+
+  while ((match = anchorRegex.exec(html)) !== null) {
+    const attrs = match[1];
+    const inner = match[2];
+
+    const hrefMatch = attrs.match(
+      /\bhref\s*=\s*["']([^"']+)["']/i
+    );
+
+    if (!hrefMatch) continue;
+
+    const href = decodeHtml(hrefMatch[1]).trim();
+
+    if (
+      !/(?:anime|movies)-streaming\.html(?:[?#]|$)/i.test(href)
+    ) {
+      continue;
+    }
+
+    const url = absoluteUrl(href, pageUrl);
+    const title = stripHtml(inner);
+
+    if (!url || !title) continue;
+
+    const key = url.split("#")[0];
+
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    const idMatch = url.match(
+      /-(\d+)-(?:anime|movies)-streaming\.html/i
+    );
+
+    results.push({
+      id: idMatch ? idMatch[1] : url,
+      title,
+      url,
+      poster: "",
+      kind: /movies-streaming\.html/i.test(url)
+        ? "movie"
+        : "tv"
+    });
+  }
+
+  return results;
+}
+
+/* -------------------- Search -------------------- */
+
 async function searchArabicToons(query) {
   const key = "search:" + normalizeTitle(query);
 
@@ -321,21 +397,39 @@ async function searchArabicToons(query) {
       SITE + "/search_results.php?q=" +
       encodeURIComponent(query) + "&ajax=1";
 
-    const data = await fetchJson(url);
+    /*
+     * Read the response as text first.
+     * Some endpoints return JSON; others may return HTML.
+     */
+    const page = await fetchText(url);
 
-    const results = getSearchItems(data);
+    let results = [];
+
+    try {
+      results = getSearchItems(JSON.parse(page.text));
+    } catch (_) {
+      results = parseSearchHtml(page.text, page.url);
+    }
+
     const seen = new Set();
 
     const unique = results.filter(item => {
-      const key = item.url.split("#")[0];
+      const itemKey = item.url.split("#")[0];
 
-      if (seen.has(key)) return false;
-      seen.add(key);
+      if (seen.has(itemKey)) return false;
 
+      seen.add(itemKey);
       return true;
     });
 
-    log("Search:", query, "| results:", unique.length);
+    log(
+      "Search:",
+      query,
+      "| response:",
+      page.contentType || "unknown",
+      "| results:",
+      unique.length
+    );
 
     return unique;
   });
@@ -381,6 +475,7 @@ async function findBestResult(titles, mediaType) {
         const key = item.url.split("#")[0];
 
         if (seen.has(key)) continue;
+
         seen.add(key);
         allResults.push(item);
       }
@@ -413,7 +508,10 @@ function extractEpisodeLinks(html, pageUrl) {
     const attrs = match[1];
     const inner = match[2];
 
-    const hrefMatch = attrs.match(/\bhref\s*=\s*["']([^"']+)["']/i);
+    const hrefMatch = attrs.match(
+      /\bhref\s*=\s*["']([^"']+)["']/i
+    );
+
     if (!hrefMatch) continue;
 
     const href = decodeHtml(hrefMatch[1]).trim();
@@ -421,16 +519,22 @@ function extractEpisodeLinks(html, pageUrl) {
     if (!/\.html(?:[?#]|$)/i.test(href)) continue;
 
     const numberMatch =
-      inner.match(/class=["'][^"']*episode-number[^"']*["'][^>]*>\s*(\d+)/i) ||
+      inner.match(
+        /class=["'][^"']*episode-number[^"']*["'][^>]*>\s*(\d+)/i
+      ) ||
       inner.match(/(?:episode|الحلقة|حلقة)\s*[-:#]?\s*(\d+)/i) ||
       attrs.match(/(?:episode|ep)[-_ ]?(\d+)/i);
 
     if (!numberMatch) continue;
 
     const url = absoluteUrl(href, pageUrl);
-    if (!url || seen.has(url.split("#")[0])) continue;
 
-    seen.add(url.split("#")[0]);
+    if (!url) continue;
+
+    const key = url.split("#")[0];
+
+    if (seen.has(key)) continue;
+    seen.add(key);
 
     results.push({
       number: Number(numberMatch[1]),
@@ -450,7 +554,12 @@ function extractEpisodeLinks(html, pageUrl) {
 
       if (url && !seen.has(url.split("#")[0])) {
         seen.add(url.split("#")[0]);
-        results.push({ number, url, title: "Episode " + number });
+
+        results.push({
+          number,
+          url,
+          title: "Episode " + number
+        });
       }
     }
   }
@@ -475,14 +584,17 @@ async function chooseEpisode(seriesUrl, season, episode) {
     throw new Error("Invalid or missing episode number");
   }
 
-  let matches = episodes.filter(item => item.number === wantedEpisode);
+  const matches = episodes.filter(
+    item => item.number === wantedEpisode
+  );
 
-  if (matches.length === 1) return matches[0].url;
+  if (matches.length === 1) {
+    return matches[0].url;
+  }
 
   if (matches.length > 1 && season != null) {
     const seasonPattern = new RegExp(
-      "(?:season|الموسم|موسم)[\\s_-]*" +
-      Number(season),
+      "(?:season|الموسم|موسم)[\\s_-]*" + Number(season),
       "i"
     );
 
