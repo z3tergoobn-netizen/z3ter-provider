@@ -903,22 +903,33 @@ async function getStreams(tmdbId, mediaType, season, episode) {
 
     let playbackPage = match.url;
 
-    if (mediaType === "tv") {
-      stage = "episode selection";
+if (mediaType === "tv") {
+  stage = "episode selection";
 
-      if (episode == null) {
-        console.log("[Z3ter] TV request has no episode number.");
-        return [];
-      }
+  if (episode == null) {
+    console.log("[Z3ter] TV request has no episode number.");
+    return [];
+  }
 
-      playbackPage = await getEpisodeUrl(
-        match.url,
-        season,
-        episode
-      );
+  playbackPage = await getEpisodeUrl(
+    match.url,
+    season,
+    episode
+  );
 
-      console.log("[Z3ter] Selected episode page:", playbackPage);
-    }
+  console.log("[Z3ter] Selected episode page:", playbackPage);
+
+} else if (mediaType === "movie") {
+  stage = "movie playback selection";
+
+  playbackPage = await getEpisodeUrl(
+    match.url,
+    1,
+    1
+  );
+
+  console.log("[Z3ter] Selected movie playback page:", playbackPage);
+}
 
     stage = "stream extraction";
 
