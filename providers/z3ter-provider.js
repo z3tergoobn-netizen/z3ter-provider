@@ -7,7 +7,7 @@
 
 const PROVIDER_NAME = "Z3ter Provider";
 const ALOOY_HOME = "https://fitnur.com/alooytv";
-const ALOOY_FALLBACK = "https://n.alooytv14.xyz";
+const ALOOY_FALLBACK = "https://alooytv.com";
 const ELCINEMA_SEARCH = "https://elcinema.com/search/work/";
 
 const TMDB_API_KEY = "09c002491851747716f94bd211a6681b";
@@ -278,7 +278,7 @@ async function getAlooyDomain() {
 
       if (
         /alooytv/i.test(href) &&
-        /\.xyz(?:[/:?#]|$)/i.test(href)
+        /\.com(?:[/:?#]|$)/i.test(href)
       ) {
         const url = absoluteUrl(href, page.url);
         const match = url.match(/^(https?:\/\/[^/]+)/i);
