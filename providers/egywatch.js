@@ -2,7 +2,8 @@
 "use strict";
 
 /**
- * ai
+ * Egywatch Provider for Nuvio
+ * Quality display styled after Oscar TV.
  */
 
 const PROVIDER_NAME = "Egywatch";
@@ -412,6 +413,28 @@ function parseSearchItem(item) {
   };
 }
 
+function allowedForMediaType(item, mediaType) {
+  if (mediaType === "movie") {
+    return [
+      "movie",
+      "anime_movie"
+    ].includes(item.kind);
+  }
+
+  if (mediaType === "tv") {
+    return [
+      "series",
+      "anime"
+    ].includes(item.kind);
+  }
+
+  if (mediaType === "live") {
+    return item.kind === "live";
+  }
+
+  return false;
+}
+
 async function searchEgywatch(query) {
   const q = encodeURIComponent(query).replace(/%20/g, "%20");
 
@@ -438,28 +461,6 @@ async function searchEgywatch(query) {
       seen.add(key);
       return true;
     });
-}
-
-function allowedForMediaType(item, mediaType) {
-  if (mediaType === "movie") {
-    return [
-      "movie",
-      "anime_movie"
-    ].includes(item.kind);
-  }
-
-  if (mediaType === "tv") {
-    return [
-      "series",
-      "anime"
-    ].includes(item.kind);
-  }
-
-  if (mediaType === "live") {
-    return item.kind === "live";
-  }
-
-  return false;
 }
 
 async function findBestMatch(titles, mediaType) {
@@ -804,21 +805,94 @@ function parseVideoHeaders(video) {
   return { referer, origin };
 }
 
-function qualityFrom(value, url) {
-  const source = clean(value) + " " + clean(url);
+/* -------------------- Oscar TV style quality -------------------- */
 
-  const match = source.match(
+function getQualityInfo(value, url) {
+  const source = clean(value);
+  const combined = source + " " + clean(url);
+
+  const match = combined.match(
     /(?:^|\D)(2160|1440|1080|720|576|540|480|360)p?(?:\D|$)/i
   );
 
-  if (match) return Number(match[1]);
+  if (match) {
+    const resolution = Number(match[1]);
+    let label;
 
-  if (/\b(4k|uhd)\b/i.test(source)) return 2160;
+    if (resolution >= 2160) label = "4K UHD";
+    else if (resolution >= 1440) label = "QHD";
+    else if (resolution >= 1080) label = "FHD";
+    else if (resolution >= 720) label = "HD";
+    else label = "SD";
 
-  return 0;
+    return {
+      resolution,
+      quality: resolution + "p",
+      label
+    };
+  }
+
+  if (/\b(?:4k|uhd|ultra[\s-]*hd)\b/i.test(combined)) {
+    return {
+      resolution: 2160,
+      quality: "2160p",
+      label: "4K UHD"
+    };
+  }
+
+  if (/\b(?:fhd|full[\s-]*hd)\b/i.test(combined)) {
+    return {
+      resolution: 1080,
+      quality: "1080p",
+      label: "FHD"
+    };
+  }
+
+  if (/\bqhd\b/i.test(combined)) {
+    return {
+      resolution: 1440,
+      quality: "1440p",
+      label: "QHD"
+    };
+  }
+
+  if (/\bhd\b/i.test(combined)) {
+    return {
+      resolution: 0,
+      quality: "HD",
+      label: "HD"
+    };
+  }
+
+  if (/\b(?:sd|low|mobile)\b/i.test(combined)) {
+    return {
+      resolution: 480,
+      quality: "480p",
+      label: "SD"
+    };
+  }
+
+  return {
+    resolution: 0,
+    quality: "Auto",
+    label: "Auto"
+  };
 }
 
-function streamFormat(url) {
+function getQualityEmoji(resolution) {
+  if (resolution >= 2160) return "👑";
+  if (resolution >= 1440) return "💎";
+  if (resolution >= 1080) return "⚡";
+  if (resolution >= 720) return "🔥";
+  if (resolution >= 576) return "🎯";
+  if (resolution >= 540) return "🟣";
+  if (resolution >= 480) return "📺";
+  if (resolution > 0) return "📱";
+
+  return "❔";
+}
+
+function getFormat(url) {
   const value = clean(url).toLowerCase();
 
   if (/\.m3u8(?:$|[?#])/.test(value)) return "HLS";
@@ -830,28 +904,41 @@ function streamFormat(url) {
   return "Direct";
 }
 
-function createStream(url, server, quality, headers) {
-  const resolution = qualityFrom(quality, url);
-  const format = streamFormat(url);
+function qualityRank(stream) {
+  const resolution = Number(stream?.resolution) || 0;
 
-  const qualityLabel = resolution
-    ? resolution + "p"
-    : "Auto";
+  if (resolution > 0) return resolution;
+  if (stream?.quality === "HD") return 700;
+
+  return -1;
+}
+
+function createStream(url, server, quality, headers) {
+  const info = getQualityInfo(quality, url);
+  const format = getFormat(url);
+  const emoji = getQualityEmoji(info.resolution);
+  const serverName = clean(server) || PROVIDER_NAME;
+
+  const details =
+    "🎞️ " + info.quality +
+    " · " + format +
+    " · 🎬 " + PROVIDER_NAME +
+    " · 🖥️ " + serverName +
+    "\nmade by 👴🏻✌🏻⁵¹⁵";
 
   return {
-    name: server || PROVIDER_NAME,
-    title:
-      "Egywatch | " + qualityLabel +
-      " | " + format,
-    description:
-      "Egywatch · " + qualityLabel +
-      " · " + format,
+    name: "\u200E" + emoji + " " + info.label,
+    title: details,
+    description: details,
+    size: details,
     url,
-    quality: qualityLabel,
-    resolution,
+    quality: info.quality,
+    resolution: info.resolution,
     headers: headers || {}
   };
 }
+
+/* -------------------- Host extraction -------------------- */
 
 async function extractHost(video, callback) {
   const link = clean(video.link);
@@ -1056,9 +1143,7 @@ async function resolveAllVideos(videos) {
   });
 
   streams.sort(
-    (a, b) =>
-      (Number(b.resolution) || 0) -
-      (Number(a.resolution) || 0)
+    (a, b) => qualityRank(b) - qualityRank(a)
   );
 
   log("Resolved streams:", streams.length);
