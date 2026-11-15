@@ -2,12 +2,11 @@
 "use strict";
 
 /**
- *  AI
+ *  AI.2.
  */
 
 const PROVIDER_NAME = "Stardima";
 const START_URL = "https://www.stardima.com/";
-const FALLBACK_URL = "https://watch.stardima.com/";
 const TMDB_API_KEY = "09c002491851747716f94bd211a6681b";
 
 const USER_AGENT =
@@ -49,6 +48,7 @@ async function withCache(key, ttl, loader) {
     if (cache.get(key)?.promise === promise) {
       cache.delete(key);
     }
+
     throw error;
   }
 }
@@ -211,18 +211,29 @@ async function request(url, referer) {
 }
 
 /* =========================================================
-   DOMAIN DISCOVERY
+   CATALOG DOMAIN DISCOVERY
 ========================================================= */
 
-function isAllowedDomain(url) {
+/*
+ * نطاق الكتالوج هو نطاق الموقع الذي يحتوي على:
+ * - البحث
+ * - صفحات الأفلام
+ * - صفحات المسلسلات
+ * - صفحات المواسم والحلقات
+ *
+ * لا نستخدم نطاقات watch-* كنطاق للكتالوج.
+ * نطاق المشغّل يتم اكتشافه لاحقاً من صفحة الحلقة نفسها.
+ */
+
+function isAllowedCatalogDomain(url) {
   try {
     const host = new URL(url).hostname.toLowerCase();
 
     return (
       host === "stardima.com" ||
-      host.endsWith(".stardima.com") ||
+      host === "www.stardima.com" ||
       host === "stardima.com.im" ||
-      host.endsWith(".stardima.com.im")
+      host === "www.stardima.com.im"
     );
   } catch (_) {
     return false;
@@ -237,61 +248,34 @@ function getOrigin(url) {
   }
 }
 
-function discoverLinks(html, baseUrl) {
-  const links = [];
-  const expression = /<a\b[^>]*>/gi;
-  let match;
+async function validateCatalogDomain(origin) {
+  if (!isAllowedCatalogDomain(origin)) {
+    return false;
+  }
 
-  while ((match = expression.exec(html))) {
-    const href = getAttr(match[0], "href");
+  try {
+    const page = await request(origin + "/", START_URL);
 
-    if (!href) continue;
+    const finalOrigin = getOrigin(page.url || origin);
+    const html = page.html || "";
 
-    const url = absoluteUrl(href, baseUrl);
-
-    if (url && isAllowedDomain(url)) {
-      links.push(url);
+    if (!finalOrigin || !isAllowedCatalogDomain(finalOrigin)) {
+      return false;
     }
-  }
 
-  // اكتشاف النطاقات الموجودة في JavaScript أو HTML.
-  const domainExpression =
-    /https?:\/\/(?:[a-z0-9-]+\.)*stardima\.com(?:\.im)?/gi;
-
-  while ((match = domainExpression.exec(html))) {
-    if (isAllowedDomain(match[0])) {
-      links.push(match[0]);
+    if (!/stardima|ستارديما/i.test(html)) {
+      return false;
     }
+
+    return finalOrigin;
+  } catch (error) {
+    console.log(
+      "[Stardima] Catalog validation:",
+      error.message || String(error)
+    );
+
+    return false;
   }
-
-  return unique(links);
-}
-
-async function validateDomain(origin) {
-  if (!isAllowedDomain(origin)) return false;
-
-  const tests = [
-    origin + "/watch/movies/",
-    origin + "/watch/tvshows/",
-    origin + "/"
-  ];
-
-  for (const url of tests) {
-    try {
-      const page = await request(url, START_URL);
-
-      const text = page.html.toLowerCase();
-
-      if (
-        /stardima|ستارديما/i.test(text) ||
-        /watch\/movies|watch\/tvshows/i.test(text)
-      ) {
-        return getOrigin(page.url || url);
-      }
-    } catch (_) {}
-  }
-
-  return false;
 }
 
 async function discoverDomain(force) {
@@ -305,48 +289,51 @@ async function discoverDomain(force) {
 
   const candidates = [];
 
-  // المصدر الأساسي.
   try {
     const home = await request(START_URL);
 
     const redirectedOrigin = getOrigin(home.url);
 
-    if (redirectedOrigin && isAllowedDomain(redirectedOrigin)) {
+    if (
+      redirectedOrigin &&
+      isAllowedCatalogDomain(redirectedOrigin)
+    ) {
       candidates.push(redirectedOrigin);
     }
 
-    candidates.push(
-      ...discoverLinks(home.html, home.url)
-        .map(getOrigin)
-    );
+    /*
+     * لا نستخرج نطاق الكتالوج من روابط المشغلات.
+     * نكتفي بالنطاق النهائي الذي أعاده الموقع الرسمي.
+     */
   } catch (error) {
     console.log(
-      "[Stardima] Main domain discovery:",
+      "[Stardima] Main catalog discovery:",
       error.message || String(error)
     );
   }
 
-  // النطاق الاحتياطي الحالي.
-  candidates.push(getOrigin(FALLBACK_URL));
+  // النطاق الرسمي مرشح أخير للكتالوج فقط.
+  candidates.push("https://www.stardima.com");
 
-  const uniqueCandidates = unique(candidates);
-
-  for (const candidate of uniqueCandidates) {
-    if (!candidate || !isAllowedDomain(candidate)) continue;
-
-    const valid = await validateDomain(candidate);
+  for (const candidate of unique(candidates)) {
+    const valid = await validateCatalogDomain(candidate);
 
     if (valid) {
       cachedDomain = valid;
       domainExpiresAt = Date.now() + CACHE_TTL;
 
-      console.log("[Stardima] Active domain:", cachedDomain);
+      console.log(
+        "[Stardima] Active catalog domain:",
+        cachedDomain
+      );
 
       return cachedDomain;
     }
   }
 
-  throw new Error("Unable to discover a valid Stardima domain");
+  throw new Error(
+    "Unable to discover a valid Stardima catalog domain"
+  );
 }
 
 function siteUrl(domain, path) {
@@ -415,6 +402,7 @@ async function getMetadata(tmdbId, mediaType) {
       );
 
       addTitle(type === "tv" ? data.name : data.title);
+
       addTitle(
         type === "tv"
           ? data.original_name
@@ -457,7 +445,9 @@ async function getMetadata(tmdbId, mediaType) {
         ? alternatives.results || []
         : alternatives.titles || [];
 
-    list.forEach(item => addTitle(item.title || item.name));
+    list.forEach(item => {
+      addTitle(item.title || item.name);
+    });
   } catch (_) {}
 
   if (!titles.length) {
@@ -515,7 +505,12 @@ function extractAnchors(html, baseUrl) {
 
 function isContentUrl(url, mediaType) {
   try {
-    const path = new URL(url).pathname.toLowerCase();
+    const parsed = new URL(url);
+    const path = parsed.pathname.toLowerCase();
+
+    if (!isAllowedCatalogDomain(parsed.origin)) {
+      return false;
+    }
 
     if (mediaType === "movie") {
       return /\/watch\/movies\/[^/]+/.test(path);
@@ -602,6 +597,7 @@ async function searchSite(domain, query, mediaType) {
         const key = anchor.url.split("#")[0];
 
         if (seen.has(key)) continue;
+
         seen.add(key);
 
         found.push({
@@ -781,7 +777,7 @@ async function selectEpisode(seriesUrl, season, episode) {
 
   if (episodeUrl) return episodeUrl;
 
-  // بعض صفحات  تعرض الحلقات مباشرة داخل صفحة المسلسل.
+  // بعض صفحات المسلسلات تعرض الحلقات مباشرة.
   const fallbackUrl = findEpisodeUrl(
     seriesPage.html,
     seriesPage.url,
@@ -791,7 +787,8 @@ async function selectEpisode(seriesUrl, season, episode) {
   if (fallbackUrl) return fallbackUrl;
 
   throw new Error(
-    "Episode " + episode + " in season " + season + " was not found"
+    "Episode " + episode +
+    " in season " + season + " was not found"
   );
 }
 
@@ -799,26 +796,62 @@ async function selectEpisode(seriesUrl, season, episode) {
    PLAYER DISCOVERY
 ========================================================= */
 
+/*
+ * مهم:
+ * لا نضع قائمة ثابتة بنطاقات watch.
+ * نقرأ عنوان المشغّل من صفحة الحلقة الفعلية.
+ * لذلك يمكن أن يكون:
+ * watch-28.stardima.com.im
+ * أو watch-u5.stardima.com.im
+ * أو نطاقاً آخر يضعه الموقع مستقبلاً.
+ */
+
 function extractPlayerReferences(html, pageUrl) {
   const refs = [];
   const seen = new Set();
 
   function add(value, label) {
-    const url = absoluteUrl(value, pageUrl);
+    if (!value) return;
+
+    let cleaned = decodeHtml(String(value).trim());
+
+    cleaned = cleaned
+      .replace(/\\u0026/g, "&")
+      .replace(/\\\//g, "/")
+      .replace(/^['"]|['"]$/g, "");
+
+    const url = absoluteUrl(cleaned, pageUrl);
 
     if (!url || seen.has(url)) return;
 
     if (!/^https?:\/\//i.test(url)) return;
 
+    let parsed;
+
+    try {
+      parsed = new URL(url);
+    } catch (_) {
+      return;
+    }
+
+    // نتجنب الروابط غير المتعلقة بالمشغلات.
+    if (
+      /\.(?:jpg|jpeg|png|gif|webp|svg|css|js)(?:[?#]|$)/i.test(
+        parsed.pathname
+      )
+    ) {
+      return;
+    }
+
     seen.add(url);
 
     refs.push({
       url,
-      label: label || "Server"
+      label: label || "Player"
     });
   }
 
-  // Iframes.
+  // 1. Iframes.
   const iframeExpression = /<iframe\b[^>]*>/gi;
   let match;
 
@@ -833,7 +866,7 @@ function extractPlayerReferences(html, pageUrl) {
     );
   }
 
-  // Lazy-loaded player containers.
+  // 2. Lazy-loaded player containers.
   const elementExpression = /<(?:div|a|button)\b[^>]*>/gi;
 
   while ((match = elementExpression.exec(html))) {
@@ -841,10 +874,11 @@ function extractPlayerReferences(html, pageUrl) {
 
     const className = getAttr(tag, "class");
     const id = getAttr(tag, "id");
+
     const label =
       getAttr(tag, "title") ||
       getAttr(tag, "aria-label") ||
-      stripTags(tag);
+      "Server";
 
     const playerLike =
       /player|server|watch|embed|video/i.test(
@@ -853,19 +887,69 @@ function extractPlayerReferences(html, pageUrl) {
 
     if (!playerLike) continue;
 
-    const source =
-      getAttr(tag, "data-src") ||
-      getAttr(tag, "data-url") ||
-      getAttr(tag, "data-embed") ||
-      getAttr(tag, "data-link");
+    const attributes = [
+      "data-src",
+      "data-url",
+      "data-embed",
+      "data-link",
+      "data-lazy-src",
+      "data-iframe",
+      "data-player"
+    ];
 
-    if (source) {
-      add(source, label || "Server");
+    for (const attribute of attributes) {
+      const source = getAttr(tag, attribute);
+
+      if (source) {
+        add(source, label);
+      }
+    }
+
+    const href = getAttr(tag, "href");
+
+    if (href) {
+      add(href, label);
+    }
+  }
+
+  // 3. روابط مشغلات مكتوبة مباشرة في HTML أو JavaScript.
+  const rawUrlExpression =
+    /https?:\\?\/\\?\/[^"'<>\\\s`]+/gi;
+
+  while ((match = rawUrlExpression.exec(html))) {
+    const raw = match[0]
+      .replace(/\\\//g, "/")
+      .replace(/\\u0026/g, "&");
+
+    if (
+      /stardima\.com(?:\.im)?/i.test(raw) ||
+      /watch|player|embed|stream/i.test(raw)
+    ) {
+      add(raw, "Player");
+    }
+  }
+
+  // 4. إعدادات JavaScript الشائعة لمصادر المشغل.
+  const configExpression =
+    /(?:src|url|link|embed|player|file|source|iframe)\s*[:=]\s*["']([^"']+)["']/gi;
+
+  while ((match = configExpression.exec(html))) {
+    const value = match[1];
+
+    if (
+      /https?:|^\/\//i.test(value) ||
+      /watch|player|embed/i.test(value)
+    ) {
+      add(value, "Player");
     }
   }
 
   return refs.slice(0, MAX_PLAYER_PAGES);
 }
+
+/* =========================================================
+   DIRECT MEDIA EXTRACTION
+========================================================= */
 
 function extractDirectMedia(html, pageUrl) {
   const results = [];
@@ -896,6 +980,7 @@ function extractDirectMedia(html, pageUrl) {
     });
   }
 
+  // Video and source tags.
   const sourceExpression = /<(?:source|video)\b[^>]*>/gi;
   let match;
 
@@ -909,7 +994,7 @@ function extractDirectMedia(html, pageUrl) {
     );
   }
 
-  // روابط الفيديو الموجودة في الصفحة أو JavaScript.
+  // Video URLs embedded in HTML or JavaScript.
   const urlExpression =
     /(?:https?:)?\/\/[^"'<>\\\s]+?\.(?:m3u8|mp4|mpd|webm)(?:\?[^"'<>\\\s]*)?/gi;
 
@@ -919,6 +1004,10 @@ function extractDirectMedia(html, pageUrl) {
 
   return results;
 }
+
+/* =========================================================
+   PLAYER INSPECTION
+========================================================= */
 
 async function inspectPlayer(reference, parentUrl) {
   try {
@@ -953,7 +1042,7 @@ async function extractStreams(pageUrl) {
 
   const streams = [];
 
-  // الروابط المباشرة الموجودة في صفحة العمل.
+  // Direct media links in the episode/movie page.
   const direct = extractDirectMedia(html, page.url);
 
   direct.forEach(item => {
@@ -964,7 +1053,7 @@ async function extractStreams(pageUrl) {
     });
   });
 
-  // اكتشاف مشغلات الموقع.
+  // Discover player URLs from the actual playback page.
   const players = extractPlayerReferences(
     html,
     page.url
@@ -996,8 +1085,7 @@ async function extractStreams(pageUrl) {
     })
     .map(item => ({
       name: PROVIDER_NAME,
-      title:
-        item.server + " | " + item.quality,
+      title: item.server + " | " + item.quality,
       url: item.url,
       quality: item.quality,
       headers: {
@@ -1023,8 +1111,10 @@ async function getStreams(tmdbId, mediaType, season, episode) {
 
     if (
       mediaType === "tv" &&
-      (!Number.isFinite(Number(season)) ||
-       !Number.isFinite(Number(episode)))
+      (
+        !Number.isFinite(Number(season)) ||
+        !Number.isFinite(Number(episode))
+      )
     ) {
       console.log("[Stardima] Missing season or episode");
       return [];
@@ -1038,12 +1128,12 @@ async function getStreams(tmdbId, mediaType, season, episode) {
       episode
     );
 
-    // 1. اكتشاف النطاق الحالي.
-    stage = "domain discovery";
+    // 1. Discover the catalog domain.
+    stage = "catalog domain discovery";
 
     let domain = await discoverDomain(false);
 
-    // 2. جلب أسماء العمل من TMDB.
+    // 2. Get titles from TMDB.
     stage = "TMDB metadata";
 
     const metadata = await getMetadata(
@@ -1056,7 +1146,7 @@ async function getStreams(tmdbId, mediaType, season, episode) {
       metadata.titles
     );
 
-    // 3. البحث عن العمل.
+    // 3. Search for the movie or series.
     stage = "content search";
 
     let match = await findBestMatch(
@@ -1065,9 +1155,11 @@ async function getStreams(tmdbId, mediaType, season, episode) {
       mediaType
     );
 
-    // إذا فشل البحث، نعيد اكتشاف النطاق مرة واحدة.
+    // Refresh the catalog domain once if search fails.
     if (!match) {
-      console.log("[Stardima] Retrying after domain refresh");
+      console.log(
+        "[Stardima] Retrying after catalog refresh"
+      );
 
       domain = await discoverDomain(true);
 
@@ -1083,7 +1175,7 @@ async function getStreams(tmdbId, mediaType, season, episode) {
       return [];
     }
 
-    // 4. اختيار صفحة الفيلم أو الحلقة.
+    // 4. Select movie page or requested episode.
     stage = "episode selection";
 
     let playbackUrl = match.url;
@@ -1101,10 +1193,27 @@ async function getStreams(tmdbId, mediaType, season, episode) {
       playbackUrl
     );
 
-    // 5. استخراج المصادر.
+    // 5. Extract streams and dynamically discover player hosts.
     stage = "stream extraction";
 
-    const streams = await extractStreams(playbackUrl);
+    let streams = await extractStreams(playbackUrl);
+
+    /*
+     * If no streams were found, reload the episode page once.
+     * This helps when the player host has just rotated.
+     */
+    if (!streams.length) {
+      console.log(
+        "[Stardima] No streams. Refreshing playback page once."
+      );
+
+      const refreshedPage = await request(
+        playbackUrl,
+        domain + "/"
+      );
+
+      streams = await extractStreams(refreshedPage.url);
+    }
 
     console.log(
       "[Stardima] Streams found:",
