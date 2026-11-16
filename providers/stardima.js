@@ -1,38 +1,44 @@
 
 "use strict";
 
-/**
- *  AI.2.
+/*
+ * AI
  */
 
 const PROVIDER_NAME = "Stardima";
-const START_URL = "https://www.stardima.com/";
+
 const TMDB_API_KEY = "09c002491851747716f94bd211a6681b";
 
-const USER_AGENT =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
-  "AppleWebKit/537.36 (KHTML, like Gecko) " +
-  "Chrome/131.0.0.0 Safari/537.36";
+const API_KEY =
+  "vGIu8q9aap55zyANSD3jvmbttClhuRmykbQjzsIQxoWloFmp29W2qqdTSrwR";
+
+const APP_UA = "jcartoonApp/1.0.8 (Android)";
+
+const API_CANDIDATES = [
+  "https://f5f-efgeg59852-zfz2d-mmltizwwcvb5567r2r63e-zd46.stardima.app",
+  "https://app.stardima.com",
+  "https://jcartoonapp.wiib.top"
+];
 
 const CACHE_TTL = 5 * 60 * 1000;
 const TMDB_CACHE_TTL = 30 * 60 * 1000;
-const MAX_PLAYER_PAGES = 12;
+const MATCH_THRESHOLD = 45;
 
-let cachedDomain = null;
-let domainExpiresAt = 0;
+let activeApiBase = null;
+let apiBaseExpiresAt = 0;
 
 const cache = new Map();
 
-/* =========================================================
+/* =====================================================
    CACHE
-========================================================= */
+===================================================== */
 
-async function withCache(key, ttl, loader) {
+async function cached(key, ttl, loader) {
   const now = Date.now();
-  const cached = cache.get(key);
+  const item = cache.get(key);
 
-  if (cached && cached.expiresAt > now) {
-    return cached.promise;
+  if (item && item.expiresAt > now) {
+    return item.promise;
   }
 
   const promise = Promise.resolve().then(loader);
@@ -53,62 +59,27 @@ async function withCache(key, ttl, loader) {
   }
 }
 
-async function mapLimit(items, limit, mapper) {
-  const results = new Array(items.length);
-  let next = 0;
+/* =====================================================
+   GENERAL UTILITIES
+===================================================== */
 
-  const workers = Array.from(
-    { length: Math.min(limit, items.length) },
-    async () => {
-      while (true) {
-        const index = next++;
-
-        if (index >= items.length) return;
-
-        try {
-          results[index] = await mapper(items[index], index);
-        } catch (_) {
-          results[index] = null;
-        }
-      }
-    }
-  );
-
-  await Promise.all(workers);
-  return results;
-}
-
-/* =========================================================
-   TEXT UTILITIES
-========================================================= */
-
-function decodeHtml(value) {
+function cleanText(value) {
   return String(value || "")
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]*>/g, " ")
     .replace(/&amp;/gi, "&")
     .replace(/&quot;/gi, '"')
     .replace(/&#39;|&apos;/gi, "'")
     .replace(/&lt;/gi, "<")
     .replace(/&gt;/gi, ">")
     .replace(/&nbsp;/gi, " ")
-    .replace(/&#(\d+);/g, (_, n) =>
-      String.fromCharCode(Number(n))
-    )
-    .replace(/&#x([0-9a-f]+);/gi, (_, n) =>
-      String.fromCharCode(parseInt(n, 16))
-    );
-}
-
-function stripTags(value) {
-  return decodeHtml(
-    String(value || "")
-      .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ")
-      .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ")
-      .replace(/<[^>]*>/g, " ")
-  ).replace(/\s+/g, " ").trim();
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function normalizeTitle(value) {
-  return stripTags(value)
+  return cleanText(value)
     .toLowerCase()
     .replace(/[\u064B-\u065F\u0670ـ]/g, "")
     .replace(/[أإآٱ]/g, "ا")
@@ -119,8 +90,8 @@ function normalizeTitle(value) {
 }
 
 function unique(values) {
-  const result = [];
   const seen = new Set();
+  const result = [];
 
   for (const value of values) {
     if (!value) continue;
@@ -136,238 +107,168 @@ function unique(values) {
   return result;
 }
 
-function getAttr(tag, name) {
-  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-
-  const match = String(tag || "").match(
-    new RegExp(
-      "\\b" + escaped +
-      "\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)'|([^\\s>]+))",
-      "i"
+function encodeQuery(params) {
+  return Object.keys(params)
+    .map(key =>
+      encodeURIComponent(key) +
+      "=" +
+      encodeURIComponent(String(params[key]))
     )
-  );
-
-  return match
-    ? decodeHtml(match[1] || match[2] || match[3] || "")
-    : "";
+    .join("&");
 }
 
-function absoluteUrl(value, base) {
-  const url = decodeHtml(String(value || "").trim());
-
-  if (
-    !url ||
-    /^(javascript:|data:|blob:|mailto:|tel:)/i.test(url)
-  ) {
-    return "";
-  }
-
+function safeJsonParse(text) {
   try {
-    return new URL(url, base).href;
+    return JSON.parse(text);
   } catch (_) {
-    return "";
+    return null;
   }
 }
 
-function originOf(url) {
-  try {
-    return new URL(url).origin;
-  } catch (_) {
-    return "";
-  }
+function getArray(value) {
+  return Array.isArray(value) ? value : [];
 }
 
-/* =========================================================
+function getNumber(value, fallback) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : fallback;
+}
+
+/* =====================================================
    HTTP
-========================================================= */
+===================================================== */
 
-async function request(url, referer) {
-  const headers = {
-    "User-Agent": USER_AGENT,
-    "Accept":
-      "text/html,application/xhtml+xml,application/json,*/*",
-    "Accept-Language": "ar,en;q=0.9"
+function apiHeaders() {
+  return {
+    "User-Agent": APP_UA,
+    "Accept": "application/json",
+    "Accept-Language": "ar",
+    "x-api-key": API_KEY,
+    "x-app-version": "1.0.8",
+    "x-app-name": "stardima",
+    "x-device": "Xiaomi M2006C3MG",
+    "x-platform": "Android 14",
+    "X-Secure-Token": "HACKER_DETECTED_TAMPERED_APK",
+    "X-Timestamp": String(Math.floor(Date.now() / 1000))
   };
+}
 
-  if (referer) {
-    headers.Referer = referer;
-  }
-
+async function request(url, headers) {
   const response = await fetch(url, {
     method: "GET",
-    headers,
+    headers: headers || apiHeaders(),
     redirect: "follow"
   });
 
+  const text = await response.text();
+
   if (!response.ok) {
-    throw new Error("HTTP " + response.status + ": " + url);
+    throw new Error(
+      "HTTP " + response.status + " at " + url
+    );
   }
 
   return {
-    html: await response.text(),
+    text,
+    json: safeJsonParse(text),
     url: response.url || url,
-    contentType: response.headers.get("content-type") || ""
+    contentType:
+      response.headers.get("content-type") || ""
   };
 }
 
-/* =========================================================
-   CATALOG DOMAIN DISCOVERY
-========================================================= */
+async function getJson(url) {
+  const response = await request(url);
 
-/*
- * نطاق الكتالوج هو نطاق الموقع الذي يحتوي على:
- * - البحث
- * - صفحات الأفلام
- * - صفحات المسلسلات
- * - صفحات المواسم والحلقات
- *
- * لا نستخدم نطاقات watch-* كنطاق للكتالوج.
- * نطاق المشغّل يتم اكتشافه لاحقاً من صفحة الحلقة نفسها.
- */
-
-function isAllowedCatalogDomain(url) {
-  try {
-    const host = new URL(url).hostname.toLowerCase();
-
-    return (
-      host === "stardima.com" ||
-      host === "www.stardima.com" ||
-      host === "stardima.com.im" ||
-      host === "www.stardima.com.im"
-    );
-  } catch (_) {
-    return false;
+  if (!response.json || typeof response.json !== "object") {
+    throw new Error("Invalid JSON response");
   }
+
+  return response.json;
 }
 
-function getOrigin(url) {
-  try {
-    return new URL(url).origin;
-  } catch (_) {
-    return "";
-  }
+/* =====================================================
+   API HOST DISCOVERY
+===================================================== */
+
+function normalizeBase(value) {
+  return String(value || "").trim().replace(/\/+$/, "");
 }
 
-async function validateCatalogDomain(origin) {
-  if (!isAllowedCatalogDomain(origin)) {
-    return false;
-  }
-
-  try {
-    const page = await request(origin + "/", START_URL);
-
-    const finalOrigin = getOrigin(page.url || origin);
-    const html = page.html || "";
-
-    if (!finalOrigin || !isAllowedCatalogDomain(finalOrigin)) {
-      return false;
-    }
-
-    if (!/stardima|ستارديما/i.test(html)) {
-      return false;
-    }
-
-    return finalOrigin;
-  } catch (error) {
-    console.log(
-      "[Stardima] Catalog validation:",
-      error.message || String(error)
-    );
-
-    return false;
-  }
-}
-
-async function discoverDomain(force) {
+async function discoverApiBase(force) {
   if (
     !force &&
-    cachedDomain &&
-    Date.now() < domainExpiresAt
+    activeApiBase &&
+    Date.now() < apiBaseExpiresAt
   ) {
-    return cachedDomain;
+    return activeApiBase;
   }
 
-  const candidates = [];
-
-  try {
-    const home = await request(START_URL);
-
-    const redirectedOrigin = getOrigin(home.url);
-
-    if (
-      redirectedOrigin &&
-      isAllowedCatalogDomain(redirectedOrigin)
-    ) {
-      candidates.push(redirectedOrigin);
-    }
-
-    /*
-     * لا نستخرج نطاق الكتالوج من روابط المشغلات.
-     * نكتفي بالنطاق النهائي الذي أعاده الموقع الرسمي.
-     */
-  } catch (error) {
-    console.log(
-      "[Stardima] Main catalog discovery:",
-      error.message || String(error)
-    );
-  }
-
-  // النطاق الرسمي مرشح أخير للكتالوج فقط.
-  candidates.push("https://www.stardima.com");
-
-  for (const candidate of unique(candidates)) {
-    const valid = await validateCatalogDomain(candidate);
-
-    if (valid) {
-      cachedDomain = valid;
-      domainExpiresAt = Date.now() + CACHE_TTL;
-
-      console.log(
-        "[Stardima] Active catalog domain:",
-        cachedDomain
+  for (const candidate of API_CANDIDATES) {
+    try {
+      const info = await getJson(
+        candidate + "/api/app/info"
       );
 
-      return cachedDomain;
+      const data = info.data || {};
+
+      const serverUrl = normalizeBase(data.server_url);
+
+      const selected = serverUrl || candidate;
+
+      if (!/^https:\/\//i.test(selected)) {
+        continue;
+      }
+
+      activeApiBase = selected;
+      apiBaseExpiresAt = Date.now() + CACHE_TTL;
+
+      console.log(
+        "[Stardima] API host:",
+        activeApiBase
+      );
+
+      return activeApiBase;
+
+    } catch (error) {
+      console.log(
+        "[Stardima] Host unavailable:",
+        candidate,
+        error.message || String(error)
+      );
     }
   }
 
-  throw new Error(
-    "Unable to discover a valid Stardima catalog domain"
-  );
+  throw new Error("Unable to discover Stardima API host");
 }
 
-function siteUrl(domain, path) {
-  return domain.replace(/\/+$/, "") + "/" +
-    String(path || "").replace(/^\/+/, "");
-}
-
-/* =========================================================
-   TMDB
-========================================================= */
+/* =====================================================
+   TMDB METADATA
+===================================================== */
 
 async function tmdbJson(path, language) {
   const url =
     "https://api.themoviedb.org/3/" +
     path +
-    "?api_key=" + encodeURIComponent(TMDB_API_KEY) +
-    "&language=" + encodeURIComponent(language);
+    "?api_key=" +
+    encodeURIComponent(TMDB_API_KEY) +
+    "&language=" +
+    encodeURIComponent(language);
 
-  return withCache(
+  return cached(
     "tmdb:" + url,
     TMDB_CACHE_TTL,
     async () => {
-      const response = await fetch(url, {
-        headers: {
-          Accept: "application/json",
-          "User-Agent": USER_AGENT
-        }
+      const response = await request(url, {
+        "Accept": "application/json",
+        "User-Agent": APP_UA
       });
 
-      if (!response.ok) {
-        throw new Error("TMDB HTTP " + response.status);
+      if (!response.json) {
+        throw new Error("TMDB returned invalid JSON");
       }
 
-      return response.json();
+      return response.json;
     }
   );
 }
@@ -378,16 +279,18 @@ async function getMetadata(tmdbId, mediaType) {
 
   const titles = [];
   let year = null;
-  const seasonCounts = {};
 
   function addTitle(value) {
-    const title = stripTags(value || "");
+    const title = cleanText(value);
+
+    if (!title) return;
+
+    const normalized = normalizeTitle(title);
 
     if (
-      title &&
+      normalized &&
       !titles.some(
-        item =>
-          normalizeTitle(item) === normalizeTitle(title)
+        item => normalizeTitle(item) === normalized
       )
     ) {
       titles.push(title);
@@ -411,24 +314,18 @@ async function getMetadata(tmdbId, mediaType) {
 
       if (!year) {
         year = Number(
-          String(data.release_date || data.first_air_date || "")
-            .slice(0, 4)
+          String(
+            data.release_date ||
+            data.first_air_date ||
+            ""
+          ).slice(0, 4)
         ) || null;
       }
 
-      if (type === "tv") {
-        (data.seasons || []).forEach(season => {
-          const number = Number(season.season_number);
-          const count = Number(season.episode_count);
-
-          if (number > 0 && count > 0) {
-            seasonCounts[number] = count;
-          }
-        });
-      }
     } catch (error) {
       console.log(
-        "[Stardima] TMDB " + language + ":",
+        "[Stardima] TMDB metadata:",
+        language,
         error.message || String(error)
       );
     }
@@ -442,12 +339,13 @@ async function getMetadata(tmdbId, mediaType) {
 
     const list =
       type === "tv"
-        ? alternatives.results || []
-        : alternatives.titles || [];
+        ? getArray(alternatives.results)
+        : getArray(alternatives.titles);
 
     list.forEach(item => {
       addTitle(item.title || item.name);
     });
+
   } catch (_) {}
 
   if (!titles.length) {
@@ -456,90 +354,54 @@ async function getMetadata(tmdbId, mediaType) {
 
   return {
     titles: unique(titles),
-    year,
-    seasonCounts
+    year
   };
 }
 
-/* =========================================================
-   HTML LINK PARSER
-========================================================= */
+/* =====================================================
+   STARDIMA SEARCH
+===================================================== */
 
-function extractAnchors(html, baseUrl) {
-  const anchors = [];
-  const expression =
-    /<a\b([^>]*)>([\s\S]*?)<\/a>/gi;
+async function searchStardima(base, title) {
+  const params = {
+    "categories[]": "all",
+    query: title,
+    language: "all",
+    media: "all",
+    status: "all",
+    premium: "all",
+    per_page: 40,
+    page: 1,
+    gener: "all",
+    sort: "newest",
+    year: "all"
+  };
 
-  let match;
+  const url =
+    base +
+    "/api/search?" +
+    encodeQuery(params);
 
-  while ((match = expression.exec(html))) {
-    const attrs = match[1];
-    const inner = match[2];
+  const json = await getJson(url);
 
-    const href = getAttr(attrs, "href");
-
-    if (!href) continue;
-
-    const url = absoluteUrl(href, baseUrl);
-
-    if (!url) continue;
-
-    const title =
-      getAttr(attrs, "title") ||
-      getAttr(attrs, "aria-label") ||
-      stripTags(inner);
-
-    anchors.push({
-      url,
-      title: stripTags(title),
-      text: stripTags(inner)
-    });
-  }
-
-  return anchors;
+  return getArray(json.videos);
 }
 
-/* =========================================================
-   SEARCH
-========================================================= */
-
-function isContentUrl(url, mediaType) {
-  try {
-    const parsed = new URL(url);
-    const path = parsed.pathname.toLowerCase();
-
-    if (!isAllowedCatalogDomain(parsed.origin)) {
-      return false;
-    }
-
-    if (mediaType === "movie") {
-      return /\/watch\/movies\/[^/]+/.test(path);
-    }
-
-    return (
-      /\/watch\/tvshows\/[^/]+/.test(path) ||
-      /\/watch\/seasons\/[^/]+/.test(path)
-    );
-  } catch (_) {
-    return false;
-  }
-}
-
-function titleScore(candidate, targets, year) {
+function scoreTitle(candidate, titles, year) {
   const normalized = normalizeTitle(candidate);
 
   if (!normalized) return 0;
 
   let best = 0;
 
-  targets.forEach(target => {
-    const expected = normalizeTitle(target);
+  for (const title of titles) {
+    const expected = normalizeTitle(title);
 
-    if (!expected) return;
+    if (!expected) continue;
 
     if (normalized === expected) {
       best = Math.max(best, 100);
-      return;
+      continue;
     }
 
     if (
@@ -547,23 +409,24 @@ function titleScore(candidate, targets, year) {
       expected.includes(normalized)
     ) {
       best = Math.max(best, 82);
-      return;
+      continue;
     }
 
     const words = expected.split(" ").filter(Boolean);
     const found = new Set(normalized.split(" "));
 
-    const hits = words.filter(word => found.has(word)).length;
-
     if (words.length) {
+      const hits = words.filter(word => found.has(word)).length;
       best = Math.max(best, (hits / words.length) * 70);
     }
-  });
+  }
 
   if (
     year &&
     best > 0 &&
-    new RegExp("(^|\\D)" + year + "(\\D|$)").test(candidate)
+    new RegExp("(^|\\D)" + year + "(\\D|$)").test(
+      String(candidate)
+    )
   ) {
     best += 5;
   }
@@ -571,87 +434,79 @@ function titleScore(candidate, targets, year) {
   return best;
 }
 
-async function searchSite(domain, query, mediaType) {
-  const searchPaths = [
-    "/?s=" + encodeURIComponent(query),
-    "/watch/?s=" + encodeURIComponent(query),
-    "/watch/movies/?s=" + encodeURIComponent(query),
-    "/watch/tvshows/?s=" + encodeURIComponent(query)
-  ];
-
-  const found = [];
-  const seen = new Set();
-
-  for (const path of searchPaths) {
-    try {
-      const page = await request(
-        siteUrl(domain, path),
-        domain + "/"
-      );
-
-      const anchors = extractAnchors(page.html, page.url);
-
-      for (const anchor of anchors) {
-        if (!isContentUrl(anchor.url, mediaType)) continue;
-
-        const key = anchor.url.split("#")[0];
-
-        if (seen.has(key)) continue;
-
-        seen.add(key);
-
-        found.push({
-          title: anchor.title || anchor.text,
-          url: anchor.url
-        });
-      }
-
-      if (found.length >= 5) break;
-    } catch (_) {}
-  }
-
-  return found;
+function isSeriesItem(item) {
+  return (
+    item.is_series === true ||
+    item.episode_id != null ||
+    getNumber(item.seasons_count, 0) > 0
+  );
 }
 
-async function findBestMatch(domain, metadata, mediaType) {
-  const groups = await mapLimit(
-    metadata.titles.slice(0, 8),
-    3,
-    title => searchSite(domain, title, mediaType)
-  );
+async function findBestMatch(base, metadata, mediaType) {
+  const all = [];
+
+  for (const title of metadata.titles.slice(0, 8)) {
+    try {
+      const results = await searchStardima(base, title);
+      all.push(...results);
+    } catch (error) {
+      console.log(
+        "[Stardima] Search failed:",
+        title,
+        error.message || String(error)
+      );
+    }
+  }
 
   const candidates = [];
   const seen = new Set();
 
-  groups.forEach(group => {
-    (group || []).forEach(item => {
-      if (seen.has(item.url)) return;
+  for (const item of all) {
+    if (!item || item.id == null) continue;
 
-      seen.add(item.url);
-      candidates.push(item);
-    });
-  });
+    const id = String(item.id);
 
-  let best = null;
-  let bestScore = 0;
+    if (seen.has(id)) continue;
+    seen.add(id);
 
-  candidates.forEach(candidate => {
-    const score = titleScore(
-      candidate.title,
+    if (
+      mediaType === "tv" &&
+      !isSeriesItem(item)
+    ) {
+      continue;
+    }
+
+    if (
+      mediaType === "movie" &&
+      isSeriesItem(item)
+    ) {
+      continue;
+    }
+
+    const title = cleanText(item.title);
+
+    const score = scoreTitle(
+      title,
       metadata.titles,
       metadata.year
     );
 
-    if (score > bestScore) {
-      best = candidate;
-      bestScore = score;
-    }
-  });
+    candidates.push({
+      id,
+      title,
+      score,
+      item
+    });
+  }
 
-  if (!best || bestScore < 45) {
+  candidates.sort((a, b) => b.score - a.score);
+
+  const best = candidates[0];
+
+  if (!best || best.score < MATCH_THRESHOLD) {
     console.log(
-      "[Stardima] No matching content. Candidates:",
-      candidates.length
+      "[Stardima] No suitable match:",
+      candidates.slice(0, 5)
     );
 
     return null;
@@ -660,452 +515,294 @@ async function findBestMatch(domain, metadata, mediaType) {
   console.log(
     "[Stardima] Match:",
     best.title,
-    "| Score:",
-    bestScore
+    "score:",
+    best.score
   );
 
   return best;
 }
 
-/* =========================================================
-   SEASONS AND EPISODES
-========================================================= */
+/* =====================================================
+   VIDEO DETAILS
+===================================================== */
 
-function getSeasonNumber(value) {
-  const text = normalizeTitle(value);
+async function getVideoDetails(base, id) {
+  const json = await getJson(
+    base + "/api/video/" + encodeURIComponent(id)
+  );
 
-  const patterns = [
-    /(?:season|الموسم|موسم)\s*(\d+)/i,
-    /s\s*(\d+)(?:\s|$)/i
-  ];
-
-  for (const pattern of patterns) {
-    const match = text.match(pattern);
-
-    if (match) return Number(match[1]);
+  if (json.data && typeof json.data === "object") {
+    return json.data;
   }
 
-  return null;
+  return json;
 }
 
-function getEpisodeNumber(value) {
-  const text = normalizeTitle(value);
+function isSeriesDetails(detail) {
+  const type = String(detail.type || "").toLowerCase();
 
-  const patterns = [
-    /(?:episode|ep|الحلقة|حلقه)\s*(\d+)/i,
-    /(?:الحلقه)\s*(\d+)/i,
-    /^\s*(\d+)\s*$/
-  ];
+  return type === "series" || type === "tv";
+}
 
-  for (const pattern of patterns) {
-    const match = text.match(pattern);
+/* =====================================================
+   EPISODE SELECTION
+===================================================== */
 
-    if (match) return Number(match[1]);
+async function getSeasonEpisodes(base, seasonId) {
+  const url =
+    base +
+    "/api/episodes/" +
+    encodeURIComponent(String(seasonId)) +
+    "?page=1&per_page=200&q=";
+
+  const json = await getJson(url);
+
+  if (Array.isArray(json.data)) {
+    return json.data;
   }
 
-  return null;
+  if (json.data && Array.isArray(json.data.data)) {
+    return json.data.data;
+  }
+
+  return [];
 }
 
-function findSeasonUrl(html, pageUrl, wantedSeason) {
-  const anchors = extractAnchors(html, pageUrl);
-  const matches = [];
+async function findRequestedEpisode(
+  base,
+  detail,
+  wantedSeason,
+  wantedEpisode
+) {
+  const seasons = getArray(detail.seasons);
 
-  for (const anchor of anchors) {
-    if (!/\/watch\/seasons\//i.test(anchor.url)) continue;
+  const seasonNumber = Number(wantedSeason);
+  const episodeNumber = Number(wantedEpisode);
 
-    const number = getSeasonNumber(
-      anchor.title + " " + anchor.text + " " + anchor.url
+  if (
+    !Number.isFinite(seasonNumber) ||
+    !Number.isFinite(episodeNumber)
+  ) {
+    throw new Error("Invalid season or episode number");
+  }
+
+  const season = seasons.find((item, index) => {
+    const number = getNumber(
+      item.season_number,
+      index + 1
     );
 
-    if (number === Number(wantedSeason)) {
-      matches.push(anchor.url);
-    }
-  }
+    return number === seasonNumber;
+  });
 
-  return unique(matches)[0] || "";
-}
-
-function findEpisodeUrl(html, pageUrl, wantedEpisode) {
-  const anchors = extractAnchors(html, pageUrl);
-  const matches = [];
-
-  for (const anchor of anchors) {
-    if (!/\/watch\/episodes\//i.test(anchor.url)) continue;
-
-    const number = getEpisodeNumber(
-      anchor.title + " " + anchor.text
-    );
-
-    if (number === Number(wantedEpisode)) {
-      matches.push(anchor.url);
-    }
-  }
-
-  return unique(matches)[0] || "";
-}
-
-async function selectEpisode(seriesUrl, season, episode) {
-  const seriesPage = await request(seriesUrl);
-
-  let seasonUrl = findSeasonUrl(
-    seriesPage.html,
-    seriesPage.url,
-    season
-  );
-
-  if (!seasonUrl && Number(season) === 1) {
-    seasonUrl = seriesUrl;
-  }
-
-  if (!seasonUrl) {
-    throw new Error("Season " + season + " was not found");
-  }
-
-  let seasonPage;
-
-  if (seasonUrl === seriesUrl) {
-    seasonPage = seriesPage;
-  } else {
-    seasonPage = await request(seasonUrl, seriesUrl);
-  }
-
-  const episodeUrl = findEpisodeUrl(
-    seasonPage.html,
-    seasonPage.url,
-    episode
-  );
-
-  if (episodeUrl) return episodeUrl;
-
-  // بعض صفحات المسلسلات تعرض الحلقات مباشرة.
-  const fallbackUrl = findEpisodeUrl(
-    seriesPage.html,
-    seriesPage.url,
-    episode
-  );
-
-  if (fallbackUrl) return fallbackUrl;
-
-  throw new Error(
-    "Episode " + episode +
-    " in season " + season + " was not found"
-  );
-}
-
-/* =========================================================
-   PLAYER DISCOVERY
-========================================================= */
-
-/*
- * مهم:
- * لا نضع قائمة ثابتة بنطاقات watch.
- * نقرأ عنوان المشغّل من صفحة الحلقة الفعلية.
- * لذلك يمكن أن يكون:
- * watch-28.stardima.com.im
- * أو watch-u5.stardima.com.im
- * أو نطاقاً آخر يضعه الموقع مستقبلاً.
- */
-
-function extractPlayerReferences(html, pageUrl) {
-  const refs = [];
-  const seen = new Set();
-
-  function add(value, label) {
-    if (!value) return;
-
-    let cleaned = decodeHtml(String(value).trim());
-
-    cleaned = cleaned
-      .replace(/\\u0026/g, "&")
-      .replace(/\\\//g, "/")
-      .replace(/^['"]|['"]$/g, "");
-
-    const url = absoluteUrl(cleaned, pageUrl);
-
-    if (!url || seen.has(url)) return;
-
-    if (!/^https?:\/\//i.test(url)) return;
-
-    let parsed;
-
-    try {
-      parsed = new URL(url);
-    } catch (_) {
-      return;
-    }
-
-    // نتجنب الروابط غير المتعلقة بالمشغلات.
-    if (
-      /\.(?:jpg|jpeg|png|gif|webp|svg|css|js)(?:[?#]|$)/i.test(
-        parsed.pathname
-      )
-    ) {
-      return;
-    }
-
-    seen.add(url);
-
-    refs.push({
-      url,
-      label: label || "Player"
-    });
-  }
-
-  // 1. Iframes.
-  const iframeExpression = /<iframe\b[^>]*>/gi;
-  let match;
-
-  while ((match = iframeExpression.exec(html))) {
-    const tag = match[0];
-
-    add(
-      getAttr(tag, "src") ||
-      getAttr(tag, "data-src") ||
-      getAttr(tag, "data-lazy-src"),
-      "Player"
+  if (!season || season.id == null) {
+    throw new Error(
+      "Season " + seasonNumber + " not found"
     );
   }
 
-  // 2. Lazy-loaded player containers.
-  const elementExpression = /<(?:div|a|button)\b[^>]*>/gi;
+  const episodes = await getSeasonEpisodes(
+    base,
+    season.id
+  );
 
-  while ((match = elementExpression.exec(html))) {
-    const tag = match[0];
+  const episode = episodes.find((item, index) => {
+    const number = getNumber(
+      item.episode_number,
+      index + 1
+    );
 
-    const className = getAttr(tag, "class");
-    const id = getAttr(tag, "id");
+    return number === episodeNumber;
+  });
 
-    const label =
-      getAttr(tag, "title") ||
-      getAttr(tag, "aria-label") ||
-      "Server";
-
-    const playerLike =
-      /player|server|watch|embed|video/i.test(
-        className + " " + id
-      );
-
-    if (!playerLike) continue;
-
-    const attributes = [
-      "data-src",
-      "data-url",
-      "data-embed",
-      "data-link",
-      "data-lazy-src",
-      "data-iframe",
-      "data-player"
-    ];
-
-    for (const attribute of attributes) {
-      const source = getAttr(tag, attribute);
-
-      if (source) {
-        add(source, label);
-      }
-    }
-
-    const href = getAttr(tag, "href");
-
-    if (href) {
-      add(href, label);
-    }
+  if (!episode || episode.id == null) {
+    throw new Error(
+      "Episode " +
+      episodeNumber +
+      " in season " +
+      seasonNumber +
+      " not found"
+    );
   }
 
-  // 3. روابط مشغلات مكتوبة مباشرة في HTML أو JavaScript.
-  const rawUrlExpression =
-    /https?:\\?\/\\?\/[^"'<>\\\s`]+/gi;
-
-  while ((match = rawUrlExpression.exec(html))) {
-    const raw = match[0]
-      .replace(/\\\//g, "/")
-      .replace(/\\u0026/g, "&");
-
-    if (
-      /stardima\.com(?:\.im)?/i.test(raw) ||
-      /watch|player|embed|stream/i.test(raw)
-    ) {
-      add(raw, "Player");
-    }
-  }
-
-  // 4. إعدادات JavaScript الشائعة لمصادر المشغل.
-  const configExpression =
-    /(?:src|url|link|embed|player|file|source|iframe)\s*[:=]\s*["']([^"']+)["']/gi;
-
-  while ((match = configExpression.exec(html))) {
-    const value = match[1];
-
-    if (
-      /https?:|^\/\//i.test(value) ||
-      /watch|player|embed/i.test(value)
-    ) {
-      add(value, "Player");
-    }
-  }
-
-  return refs.slice(0, MAX_PLAYER_PAGES);
+  return episode;
 }
 
-/* =========================================================
-   DIRECT MEDIA EXTRACTION
-========================================================= */
+/* =====================================================
+   SERVER EXTRACTION
+===================================================== */
 
-function extractDirectMedia(html, pageUrl) {
+function unwrapStrema(url) {
+  try {
+    const parsed = new URL(url);
+
+    if (
+      !parsed.hostname.toLowerCase().includes("strema.top") ||
+      !parsed.pathname.toLowerCase().includes("/embed")
+    ) {
+      return url;
+    }
+
+    const embedded = parsed.searchParams.get("id");
+
+    if (embedded && /^https?:\/\//i.test(embedded)) {
+      return embedded;
+    }
+
+    return url;
+
+  } catch (_) {
+    return url;
+  }
+}
+
+function isDirectVideo(url, server) {
+  const value = String(url || "").trim();
+
+  if (!/^https?:\/\//i.test(value)) {
+    return false;
+  }
+
+  const type = String(server.type || "").toLowerCase();
+  const label = String(server.label || "").toLowerCase();
+
+  if (
+    type === "backup" ||
+    label === "backup" ||
+    value.toLowerCase().includes("worldnow.top")
+  ) {
+    return true;
+  }
+
+  return /\.(m3u8|mp4|mkv|mpd|webm)(?:[?#]|$)/i.test(value);
+}
+
+function detectQuality(url, server) {
+  const text = (
+    String(url || "") +
+    " " +
+    String(server.label || "") +
+    " " +
+    String(server.quality || "")
+  ).toLowerCase();
+
+  if (/2160|4k/.test(text)) return "2160p";
+  if (/1080/.test(text)) return "1080p";
+  if (/720/.test(text)) return "720p";
+  if (/480/.test(text)) return "480p";
+  if (/360/.test(text)) return "360p";
+
+  return "Auto";
+}
+
+function getServerArray(json) {
+  if (Array.isArray(json)) return json;
+
+  if (json && Array.isArray(json.servers)) {
+    return json.servers;
+  }
+
+  if (
+    json &&
+    json.data &&
+    Array.isArray(json.data.servers)
+  ) {
+    return json.data.servers;
+  }
+
+  if (json && Array.isArray(json.data)) {
+    return json.data;
+  }
+
+  return [];
+}
+
+async function getMovieServers(base, movieId) {
+  const detail = await getVideoDetails(base, movieId);
+  return getServerArray(detail);
+}
+
+async function getEpisodeServers(base, episodeId) {
+  const url =
+    base +
+    "/api/episodes/" +
+    encodeURIComponent(String(episodeId)) +
+    "/servers";
+
+  const json = await getJson(url);
+
+  return getServerArray(json);
+}
+
+/* =====================================================
+   STREAM BUILDING
+===================================================== */
+
+function buildStreams(servers, referer) {
   const results = [];
   const seen = new Set();
 
-  function add(value, label) {
-    const url = absoluteUrl(value, pageUrl);
+  for (const server of servers) {
+    if (!server) continue;
 
-    if (!url || seen.has(url)) return;
+    let url = String(server.url || "").trim();
 
-    if (!/\.(m3u8|mp4|mpd|webm)(?:[?#]|$)/i.test(url)) {
-      return;
+    if (!url) continue;
+
+    url = unwrapStrema(url);
+
+    if (!isDirectVideo(url, server)) {
+      console.log(
+        "[Stardima] External player skipped:",
+        server.label || url
+      );
+      continue;
     }
 
+    if (seen.has(url)) continue;
     seen.add(url);
 
-    let quality = "Auto";
-
-    if (/2160/i.test(url)) quality = "2160p";
-    else if (/1080/i.test(url)) quality = "1080p";
-    else if (/720/i.test(url)) quality = "720p";
-    else if (/480/i.test(url)) quality = "480p";
+    const label = cleanText(server.label || "Server");
+    const quality = detectQuality(url, server);
 
     results.push({
+      name: PROVIDER_NAME,
+      title: label + " | " + quality,
       url,
       quality,
-      label: label || "Direct"
+      headers: {
+        Referer: referer,
+        "User-Agent": APP_UA
+      }
     });
-  }
-
-  // Video and source tags.
-  const sourceExpression = /<(?:source|video)\b[^>]*>/gi;
-  let match;
-
-  while ((match = sourceExpression.exec(html))) {
-    const tag = match[0];
-
-    add(
-      getAttr(tag, "src") ||
-      getAttr(tag, "data-src"),
-      "Direct"
-    );
-  }
-
-  // Video URLs embedded in HTML or JavaScript.
-  const urlExpression =
-    /(?:https?:)?\/\/[^"'<>\\\s]+?\.(?:m3u8|mp4|mpd|webm)(?:\?[^"'<>\\\s]*)?/gi;
-
-  while ((match = urlExpression.exec(html))) {
-    add(match[0].replace(/&amp;/g, "&"), "Direct");
   }
 
   return results;
 }
 
-/* =========================================================
-   PLAYER INSPECTION
-========================================================= */
+/* =====================================================
+   MAIN NUVIO ENTRY POINT
+===================================================== */
 
-async function inspectPlayer(reference, parentUrl) {
-  try {
-    const page = await request(reference.url, parentUrl);
-
-    const media = extractDirectMedia(
-      page.html,
-      page.url
-    );
-
-    return media.map(item => ({
-      ...item,
-      referer: page.url,
-      server: reference.label
-    }));
-  } catch (error) {
-    console.log(
-      "[Stardima] Player failed:",
-      reference.url,
-      error.message || String(error)
-    );
-
-    return [];
-  }
-}
-
-async function extractStreams(pageUrl) {
-  console.log("[Stardima] Inspecting:", pageUrl);
-
-  const page = await request(pageUrl);
-  const html = page.html;
-
-  const streams = [];
-
-  // Direct media links in the episode/movie page.
-  const direct = extractDirectMedia(html, page.url);
-
-  direct.forEach(item => {
-    streams.push({
-      ...item,
-      referer: page.url,
-      server: "Direct"
-    });
-  });
-
-  // Discover player URLs from the actual playback page.
-  const players = extractPlayerReferences(
-    html,
-    page.url
-  );
-
-  console.log(
-    "[Stardima] Player references:",
-    players.length
-  );
-
-  const playerResults = await mapLimit(
-    players,
-    4,
-    reference => inspectPlayer(reference, page.url)
-  );
-
-  playerResults.forEach(group => {
-    (group || []).forEach(item => streams.push(item));
-  });
-
-  const seen = new Set();
-
-  return streams
-    .filter(item => {
-      if (!item.url || seen.has(item.url)) return false;
-
-      seen.add(item.url);
-      return true;
-    })
-    .map(item => ({
-      name: PROVIDER_NAME,
-      title: item.server + " | " + item.quality,
-      url: item.url,
-      quality: item.quality,
-      headers: {
-        Referer: item.referer || page.url,
-        "User-Agent": USER_AGENT
-      }
-    }));
-}
-
-/* =========================================================
-   NUVIO ENTRY POINT
-========================================================= */
-
-async function getStreams(tmdbId, mediaType, season, episode) {
+async function getStreams(
+  tmdbId,
+  mediaType,
+  season,
+  episode
+) {
   let stage = "validation";
 
   try {
-    if (!tmdbId) return [];
+    if (!tmdbId) {
+      console.log("[Stardima] Missing TMDB ID");
+      return [];
+    }
 
     if (mediaType !== "movie" && mediaType !== "tv") {
+      console.log(
+        "[Stardima] Unsupported media type:",
+        mediaType
+      );
       return [];
     }
 
@@ -1128,12 +825,10 @@ async function getStreams(tmdbId, mediaType, season, episode) {
       episode
     );
 
-    // 1. Discover the catalog domain.
-    stage = "catalog domain discovery";
+    stage = "API discovery";
 
-    let domain = await discoverDomain(false);
+    let base = await discoverApiBase(false);
 
-    // 2. Get titles from TMDB.
     stage = "TMDB metadata";
 
     const metadata = await getMetadata(
@@ -1146,25 +841,23 @@ async function getStreams(tmdbId, mediaType, season, episode) {
       metadata.titles
     );
 
-    // 3. Search for the movie or series.
-    stage = "content search";
+    stage = "Content search";
 
     let match = await findBestMatch(
-      domain,
+      base,
       metadata,
       mediaType
     );
 
-    // Refresh the catalog domain once if search fails.
     if (!match) {
       console.log(
-        "[Stardima] Retrying after catalog refresh"
+        "[Stardima] Refreshing API discovery"
       );
 
-      domain = await discoverDomain(true);
+      base = await discoverApiBase(true);
 
       match = await findBestMatch(
-        domain,
+        base,
         metadata,
         mediaType
       );
@@ -1175,55 +868,73 @@ async function getStreams(tmdbId, mediaType, season, episode) {
       return [];
     }
 
-    // 4. Select movie page or requested episode.
-    stage = "episode selection";
+    stage = "Video details";
 
-    let playbackUrl = match.url;
-
-    if (mediaType === "tv") {
-      playbackUrl = await selectEpisode(
-        match.url,
-        Number(season),
-        Number(episode)
-      );
-    }
-
-    console.log(
-      "[Stardima] Playback page:",
-      playbackUrl
+    const detail = await getVideoDetails(
+      base,
+      match.id
     );
 
-    // 5. Extract streams and dynamically discover player hosts.
-    stage = "stream extraction";
+    let servers = [];
 
-    let streams = await extractStreams(playbackUrl);
+    if (mediaType === "movie") {
+      if (isSeriesDetails(detail)) {
+        console.log(
+          "[Stardima] Type mismatch: expected movie"
+        );
+        return [];
+      }
 
-    /*
-     * If no streams were found, reload the episode page once.
-     * This helps when the player host has just rotated.
-     */
-    if (!streams.length) {
-      console.log(
-        "[Stardima] No streams. Refreshing playback page once."
+      stage = "Movie servers";
+
+      servers = await getMovieServers(
+        base,
+        match.id
       );
 
-      const refreshedPage = await request(
-        playbackUrl,
-        domain + "/"
+    } else {
+      if (!isSeriesDetails(detail)) {
+        console.log(
+          "[Stardima] Type mismatch: expected series"
+        );
+        return [];
+      }
+
+      stage = "Episode selection";
+
+      const selectedEpisode = await findRequestedEpisode(
+        base,
+        detail,
+        season,
+        episode
       );
 
-      streams = await extractStreams(refreshedPage.url);
+      stage = "Episode servers";
+
+      servers = await getEpisodeServers(
+        base,
+        selectedEpisode.id
+      );
     }
 
+    stage = "Stream extraction";
+
+    const streams = buildStreams(
+      servers,
+      base + "/"
+    );
+
     console.log(
-      "[Stardima] Streams found:",
+      "[Stardima] Servers:",
+      servers.length,
+      "| Direct streams:",
       streams.length
     );
 
     return streams;
 
   } catch (error) {
-    console.error(
+    console.log(
       "[Stardima] Failed at:",
       stage,
       "|",
